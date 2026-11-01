@@ -1,0 +1,970 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  OWNER
+  MANAGER
+  CASHIER
+  INVENTORY_OFFICER
+  ACCOUNTANT
+  KITCHEN_STAFF
+}
+
+enum InventoryMovementType {
+  OPENING_STOCK
+  PURCHASE
+  SALE
+  RETURN
+  ADJUSTMENT
+  DAMAGE
+  TRANSFER
+}
+
+enum SaleStatus {
+  COMPLETED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  MOBILE_MONEY
+  BANK_TRANSFER
+  PAYSTACK
+  OTHER
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESSFUL
+  FAILED
+  CANCELLED
+  REVERSED
+  REFUNDED
+  UNRECONCILED
+}
+
+enum PurchasePaymentStatus {
+  UNPAID
+  PARTIAL
+  PAID
+}
+
+enum PaystackTransactionStatus {
+  PENDING
+  SUCCESSFUL
+  FAILED
+  ABANDONED
+}
+
+enum TableStatus {
+  AVAILABLE
+  OCCUPIED
+  RESERVED
+  NEEDS_CLEANING
+}
+
+enum OrderStatus {
+  OPEN
+  CLOSED
+  CANCELLED
+}
+
+enum BusinessDayStatus {
+  OPEN
+  CLOSED
+}
+
+enum KitchenStatus {
+  NEW
+  PREPARING
+  READY
+  SERVED
+  CANCELLED
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  EXPENSE
+}
+
+enum NormalBalance {
+  DEBIT
+  CREDIT
+}
+
+// A business is the tenant boundary. Every business-owned table
+// carries businessId and every query must be scoped to it.
+model Business {
+  id           String   @id @default(uuid())
+  name         String
+  phone        String?
+  address      String?
+  logoUrl      String?
+  currency     String   @default("GHS")
+  businessType String   @default("general") // e.g. provision_store, restaurant, electronics
+  isActive     Boolean  @default(true)
+  receiptCounter Int    @default(0) // incremented atomically per sale to generate receipt numbers
+  shortCode String? @unique // the code a cashier types on the till screen, with their staff number and PIN
+  requireShift Boolean @default(false) // when true, selling needs an open cashier shift
+  requireOpenDay Boolean @default(false) // when true, sales/orders are refused unless a business day is open
+  restaurantModeEnabled Boolean @default(false) // gates the Tables/Orders/Kitchen routes (rule #26 — off by default so a provision store never sees these)
+
+  // Per-business Paystack credentials — each business brings its own
+  // Paystack account, so customer payments settle to THAT business's bank
+  // account, never a shared platform account. The secret key is AES-256-GCM
+  // encrypted before storage (src/services/encryption.ts) and only ever
+  // decrypted in-memory, server-side, right before a Paystack API call —
+  // it is never returned by any API response, including to the Owner.
+  paystackPublicKey          String?
+  paystackSecretKeyEncrypted String?
+  paystackConfiguredAt       DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  users     User[]
+  auditLogs AuditLog[]
+  categories Category[]
+  products   Product[]
+  inventoryMovements InventoryMovement[]
+  sales      Sale[]
+  customers  Customer[]
+  suppliers  Supplier[]
+  purchases  Purchase[]
+  paystackTransactions PaystackTransaction[]
+  accounts   Account[]
+  journalEntries JournalEntry[]
+  expenses   Expense[]
+  tables     Table[]
+  orders     Order[]
+  businessDays BusinessDay[]
+  shifts Shift[]
+  ingredients Ingredient[]
+  ingredientMovements IngredientMovement[]
+  productionBatches ProductionBatch[]
+  stockCounts StockCount[]
+
+  @@map("businesses")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  businessId   String
+  business     Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  name         String
+  email        String   @unique
+  phone        String?
+  passwordHash String
+  role         Role
+  isActive     Boolean  @default(true)
+
+  // Per-user deviations from the role's default permissions (see src/services/permissions.ts).
+  extraPermissions   String[] @default([])
+  revokedPermissions String[] @default([])
+  // Bumped on logout so every refresh token issued before it stops working.
+  tokenVersion       Int      @default(0)
+
+  // Forgot-password flow: a hashed, time-limited single-use token.
+  // Never store the raw token — only its hash, same principle as a password.
+  passwordResetTokenHash String?
+  passwordResetExpiresAt DateTime?
+
+  // Till (PIN) login for shared registers. staffNumber is the short number a
+  // cashier types with the business code; the PIN is hashed like a password.
+  staffNumber       Int?
+  pinHash           String?
+  pinFailedAttempts Int       @default(0)
+  pinLockedUntil    DateTime?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  auditLogs AuditLog[]
+  sales     Sale[]
+  shifts    Shift[]
+
+  @@unique([businessId, staffNumber])
+  @@index([businessId])
+  @@map("users")
+}
+
+// A completed cash-register transaction. Cancellation (rule #22) never
+// deletes this row — it flips status/paymentStatus and creates
+// compensating InventoryMovement RETURN entries for each item.
+model Sale {
+  id             String        @id @default(uuid())
+  businessId     String
+  business       Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  cashierId      String
+  cashier        User          @relation(fields: [cashierId], references: [id])
+
+  customerId     String?
+  customer       Customer?     @relation(fields: [customerId], references: [id])
+
+  receiptNumber  String
+  status         SaleStatus    @default(COMPLETED)
+
+  subtotal       Decimal       @db.Decimal(12, 2)
+  discountTotal  Decimal       @db.Decimal(12, 2) @default(0)
+  total          Decimal       @db.Decimal(12, 2)
+
+  paymentMethod  PaymentMethod
+  paymentStatus  PaymentStatus @default(PENDING)
+  amountTendered Decimal?      @db.Decimal(12, 2) // for cash — what the customer handed over
+  changeGiven    Decimal?      @db.Decimal(12, 2)
+
+  notes          String?
+
+  items          SaleItem[]
+  paystackTransaction PaystackTransaction?
+  order          Order?
+
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@unique([businessId, receiptNumber])
+  @@index([businessId, createdAt])
+  @@map("sales")
+}
+
+// Tracks a Paystack checkout from initialization through webhook-verified
+// completion. The Sale (and its stock reduction) is only ever created AFTER
+// verifyTransaction() independently confirms success — never on the
+// strength of a client redirect or the webhook payload alone.
+model PaystackTransaction {
+  id               String                    @id @default(uuid())
+  businessId       String
+  business         Business                  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  reference        String                    @unique
+  amount           Decimal                   @db.Decimal(12, 2)
+  status           PaystackTransactionStatus @default(PENDING)
+
+  initiatedById    String
+  customerEmail    String
+
+  // The would-be sale, captured at initialize time so nothing touches
+  // stock/receipts until payment is actually verified.
+  payload          Json
+
+  authorizationUrl String?
+  accessCode       String?
+
+  saleId           String?                   @unique
+  sale             Sale?                     @relation(fields: [saleId], references: [id])
+
+  createdAt        DateTime                  @default(now())
+  updatedAt        DateTime                  @updatedAt
+
+  @@index([businessId])
+  @@map("paystack_transactions")
+}
+
+// Line items snapshot product name/price at time of sale — so an edit to
+// the product later never changes the historical record of what was sold.
+model SaleItem {
+  id           String   @id @default(uuid())
+  saleId       String
+  sale         Sale     @relation(fields: [saleId], references: [id], onDelete: Cascade)
+
+  productId    String
+  product      Product  @relation(fields: [productId], references: [id])
+
+  productName  String
+  unitPrice    Decimal  @db.Decimal(12, 2)
+  unitCost     Decimal  @db.Decimal(12, 2) @default(0) // snapshot of product.costPrice at sale time — COGS must never drift if the product's cost changes later
+  quantity     Int
+  discount     Decimal  @db.Decimal(12, 2) @default(0)
+  lineTotal    Decimal  @db.Decimal(12, 2)
+
+  @@index([saleId])
+  @@map("sale_items")
+}
+
+model Customer {
+  id         String   @id @default(uuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  name       String
+  phone      String?
+  email      String?
+  address    String?
+  notes      String?
+
+  // Deliberately no stored balance/wallet field (rule #12/#49) —
+  // any "outstanding balance" for a customer must be computed from
+  // real Sale records, never held as an editable number here.
+  sales      Sale[]
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([businessId])
+  @@map("customers")
+}
+
+model Supplier {
+  id         String     @id @default(uuid())
+  businessId String
+  business   Business   @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  name       String
+  phone      String?
+  email      String?
+  address    String?
+  notes      String?
+
+  purchases  Purchase[]
+
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+
+  @@index([businessId])
+  @@map("suppliers")
+}
+
+// Stock coming IN from a supplier. Increases inventory via the same
+// applyInventoryMovement() path sales/opening-stock use, and tracks
+// what's owed the supplier — amountPaid/paymentStatus are only ever
+// changed by adding a PurchasePayment, never edited directly.
+model Purchase {
+  id             String                @id @default(uuid())
+  businessId     String
+  business       Business              @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  supplierId     String
+  supplier       Supplier              @relation(fields: [supplierId], references: [id])
+
+  recordedById   String
+
+  totalCost      Decimal               @db.Decimal(12, 2)
+  amountPaid     Decimal               @db.Decimal(12, 2) @default(0)
+  paymentStatus  PurchasePaymentStatus @default(UNPAID)
+
+  notes          String?
+
+  items          PurchaseItem[]
+  payments       PurchasePayment[]
+
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  @@index([businessId, createdAt])
+  @@index([businessId, supplierId])
+  @@map("purchases")
+}
+
+model PurchaseItem {
+  id          String   @id @default(uuid())
+  purchaseId  String
+  purchase    Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id])
+
+  productName String
+  costPrice   Decimal  @db.Decimal(12, 2)
+  quantity    Int
+  lineTotal   Decimal  @db.Decimal(12, 2)
+
+  @@index([purchaseId])
+  @@map("purchase_items")
+}
+
+// A payment made toward a purchase's outstanding balance. Never delete
+// or edit these after creation — Purchase.amountPaid/paymentStatus are
+// derived from the sum of these rows, kept in sync in the same transaction.
+model PurchasePayment {
+  id         String        @id @default(uuid())
+  businessId String
+
+  purchaseId String
+  purchase   Purchase      @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+
+  amount     Decimal       @db.Decimal(12, 2)
+  method     PaymentMethod
+  reference  String?
+  notes      String?
+  userId     String?
+
+  createdAt  DateTime      @default(now())
+
+  @@index([purchaseId])
+  @@map("purchase_payments")
+}
+
+model Category {
+  id          String   @id @default(uuid())
+  businessId  String
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  name        String
+  description String?
+  isActive    Boolean  @default(true)
+
+  products    Product[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([businessId, name])
+  @@index([businessId])
+  @@map("categories")
+}
+
+model Product {
+  id             String    @id @default(uuid())
+  businessId     String
+  business       Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  categoryId     String?
+  category       Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  name           String
+  description    String?
+  sku            String?
+  barcode        String?
+  unit           String    @default("unit") // e.g. piece, kg, litre
+  costPrice      Decimal   @db.Decimal(12, 2) @default(0)
+  sellingPrice   Decimal   @db.Decimal(12, 2)
+  currentQuantity Int      @default(0) // derived — only ever changed via an InventoryMovement + this same update, in one transaction
+  minStockLevel  Int       @default(0)
+  imageUrl       String?
+  isActive       Boolean   @default(true)
+
+  movements      InventoryMovement[]
+  saleItems      SaleItem[]
+  purchaseItems  PurchaseItem[]
+  orderItems     OrderItem[]
+  recipeLines    RecipeLine[]
+
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([businessId, sku])
+  @@unique([businessId, barcode])
+  @@index([businessId])
+  @@index([businessId, isActive])
+  @@map("products")
+}
+
+// Every stock quantity change must be traceable to one of these —
+// never a bare UPDATE of Product.currentQuantity (rule #10 / #45).
+model InventoryMovement {
+  id               String                @id @default(uuid())
+  businessId       String
+  business         Business              @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  productId        String
+  product          Product               @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  type             InventoryMovementType
+  quantityChange   Int                   // signed: positive for stock-in, negative for stock-out
+  previousQuantity Int
+  newQuantity      Int
+
+  reason           String?
+  reference        String?               // e.g. a future purchase/sale ID
+  userId           String?
+
+  createdAt        DateTime              @default(now())
+
+  @@index([businessId, productId, createdAt])
+  @@map("inventory_movements")
+}
+
+// Records sensitive actions across every module (rule #23 / #57).
+// Kept generic so later modules (products, sales, finance) can all write to it.
+model AuditLog {
+  id         String   @id @default(uuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  action     String   // e.g. "LOGIN", "PRODUCT_CREATE", "PRICE_CHANGE"
+  entity     String   // e.g. "User", "Product", "Sale"
+  entityId   String?
+  metadata   Json?
+
+  createdAt  DateTime @default(now())
+
+  @@index([businessId, createdAt])
+  @@map("audit_logs")
+}
+
+// A single account in the business's chart of accounts (rule #16).
+// isSystem accounts are seeded automatically on business registration
+// and can be renamed/deactivated but never deleted or have their type
+// changed — everything downstream (journal automation) depends on
+// their codes staying stable.
+model Account {
+  id            String        @id @default(uuid())
+  businessId    String
+  business      Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  code          String        // e.g. "1000" — stable identifier journal automation looks up by
+  name          String
+  type          AccountType
+  normalBalance NormalBalance // which side (debit/credit) increases this account's balance
+  isSystem      Boolean       @default(false)
+  isActive      Boolean       @default(true)
+
+  journalLines  JournalEntryLine[]
+  expensesAsCategory Expense[] @relation("ExpenseCategoryAccount")
+  expensesAsPayment  Expense[] @relation("ExpensePaymentAccount")
+
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@unique([businessId, code])
+  @@unique([businessId, name])
+  @@index([businessId])
+  @@map("accounts")
+}
+
+// One balanced double-entry transaction (rule #17: total debits = total
+// credits, enforced in src/services/journal.ts — never bypassed by any
+// direct write to JournalEntryLine). sourceType/sourceId trace it back to
+// the business event that caused it (a Sale, Purchase, Expense, etc.),
+// satisfying "financial records must be traceable" (rule #34).
+model JournalEntry {
+  id          String             @id @default(uuid())
+  businessId  String
+  business    Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  entryDate   DateTime           @default(now())
+  description String
+  sourceType  String             // "SALE", "SALE_CANCELLATION", "PURCHASE", "PURCHASE_PAYMENT", "EXPENSE"
+  sourceId    String?
+  createdById String?
+
+  lines       JournalEntryLine[]
+
+  createdAt   DateTime           @default(now())
+
+  @@index([businessId, entryDate])
+  @@index([businessId, sourceType, sourceId])
+  @@map("journal_entries")
+}
+
+model JournalEntryLine {
+  id             String       @id @default(uuid())
+  journalEntryId String
+  journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
+
+  accountId      String
+  account        Account      @relation(fields: [accountId], references: [id])
+
+  debit          Decimal      @db.Decimal(12, 2) @default(0)
+  credit         Decimal      @db.Decimal(12, 2) @default(0)
+  description    String?
+
+  @@index([journalEntryId])
+  @@index([accountId])
+  @@map("journal_entry_lines")
+}
+
+// A recorded expense (rule #18). Always produces exactly one JournalEntry
+// (Debit categoryAccount, Credit paymentAccount) — amount/accounts are
+// never edited after creation, only ever reflected via the linked entry.
+model Expense {
+  id                String   @id @default(uuid())
+  businessId        String
+  business          Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  categoryAccountId String
+  categoryAccount   Account  @relation("ExpenseCategoryAccount", fields: [categoryAccountId], references: [id])
+
+  paymentAccountId  String
+  paymentAccount    Account  @relation("ExpensePaymentAccount", fields: [paymentAccountId], references: [id])
+
+  amount            Decimal  @db.Decimal(12, 2)
+  description       String?
+  reference         String?
+  recordedById      String
+  journalEntryId    String?  @unique
+
+  createdAt         DateTime @default(now())
+
+  @@index([businessId, createdAt])
+  @@map("expenses")
+}
+
+// A physical table (rule #26). Optional — an order need not have one (e.g.
+// a bar tab or takeaway), but dine-in service usually assigns one so
+// waitstaff/kitchen can see which ticket belongs to which table.
+model Table {
+  id         String      @id @default(uuid())
+  businessId String
+  business   Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  name       String
+  capacity   Int?
+  status     TableStatus @default(AVAILABLE)
+  isActive   Boolean     @default(true)
+
+  orders     Order[]
+
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  @@unique([businessId, name])
+  @@index([businessId])
+  @@map("tables")
+}
+
+// An open tab: items are sent to the kitchen and stock is committed as
+// soon as they're added, well before payment — food service consumes
+// ingredients on preparation, not on checkout. Paying closes the order by
+// creating a normal Sale (POST /orders/:id/checkout), so accounting and
+// receipts stay on the exact same rails retail checkout already uses.
+model Order {
+  id          String      @id @default(uuid())
+  businessId  String
+  business    Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  tableId     String?
+  table       Table?      @relation(fields: [tableId], references: [id])
+
+  createdById String
+  status      OrderStatus @default(OPEN)
+  notes       String?
+
+  saleId      String?     @unique
+  sale        Sale?       @relation(fields: [saleId], references: [id])
+
+  items       OrderItem[]
+
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@index([businessId, status])
+  @@map("orders")
+}
+
+// One line on an order — its own kitchen ticket. productName/unitPrice/
+// unitCost are snapshotted the same way SaleItem does, for the same reason:
+// a later price change must never rewrite history once the item is fired.
+model OrderItem {
+  id            String        @id @default(uuid())
+  orderId       String
+  order         Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  productId     String
+  product       Product       @relation(fields: [productId], references: [id])
+
+  productName   String
+  unitPrice     Decimal       @db.Decimal(12, 2)
+  unitCost      Decimal       @db.Decimal(12, 2) @default(0)
+  quantity      Int
+  notes         String?       // e.g. modifiers: "no onions, extra cheese"
+  kitchenStatus KitchenStatus @default(NEW)
+
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@index([orderId])
+  @@map("order_items")
+}
+
+// A trading day: opened (with the cash float in the drawer), then closed after
+// the manager counts each payment method and compares it with what the
+// system expected. Sales are tied to a day by TIME (openedAt..closedAt), not
+// by a foreign key, so nothing about existing sales changes.
+model BusinessDay {
+  id            String            @id @default(uuid())
+  businessId    String
+  business      Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  status        BusinessDayStatus @default(OPEN)
+
+  openedAt      DateTime          @default(now())
+  openedById    String
+  openingFloat  Decimal           @db.Decimal(12, 2) @default(0)
+  openNotes     String?
+
+  closedAt      DateTime?
+  closedById    String?
+  closeNotes    String?
+  totalExpected Decimal?          @db.Decimal(12, 2)
+  totalCounted  Decimal?          @db.Decimal(12, 2)
+  totalVariance Decimal?          @db.Decimal(12, 2)
+
+  counts        BusinessDayCount[]
+
+  @@index([businessId, status])
+  @@index([businessId, openedAt])
+  @@map("business_days")
+}
+
+// One row per payment method counted at close. variance = counted - expected
+// (negative = short, positive = over). Any non-zero variance is posted to the
+// ledger (Cash Over/Short) and its journal entry is linked here.
+model BusinessDayCount {
+  id             String        @id @default(uuid())
+  dayId          String
+  day            BusinessDay   @relation(fields: [dayId], references: [id], onDelete: Cascade)
+
+  method         PaymentMethod
+  expected       Decimal       @db.Decimal(12, 2)
+  counted        Decimal       @db.Decimal(12, 2)
+  variance       Decimal       @db.Decimal(12, 2)
+  journalEntryId String?
+
+  @@unique([dayId, method])
+  @@map("business_day_counts")
+}
+
+// ---------------------------------------------------------------------------
+// Kitchen stock: ingredients, recipes, production and stock counts
+// ---------------------------------------------------------------------------
+
+enum IngredientMovementType {
+  OPENING_STOCK
+  PURCHASE
+  PRODUCTION_IN   // a prepared item (dough, chopped veg) was made
+  PRODUCTION_OUT  // raw/prepared items consumed by a production run
+  SALE_USAGE      // consumed by a sold dish (from its recipe)
+  SALE_RETURN     // restored when a sale/order line is cancelled
+  WASTE
+  COUNT_ADJUSTMENT
+  ADJUSTMENT
+}
+
+enum StockCountStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+}
+
+enum StockItemType {
+  PRODUCT
+  INGREDIENT
+}
+
+// Something the kitchen uses up: flour, cheese, pepperoni, or a PREPARED item
+// such as "Dough ball - Medium" made by a production run. Quantities are
+// decimals (kg, litres) unlike Product.currentQuantity, which is whole units.
+model Ingredient {
+  id              String   @id @default(uuid())
+  businessId      String
+  business        Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  name            String
+  unit            String   @default("kg")
+  isPrepared      Boolean  @default(false)
+  currentQuantity Decimal  @db.Decimal(14, 3) @default(0)
+  minStockLevel   Decimal  @db.Decimal(14, 3) @default(0)
+  costPerUnit     Decimal  @db.Decimal(14, 4) @default(0) // weighted average
+  isActive        Boolean  @default(true)
+
+  movements       IngredientMovement[]
+  recipeLines     RecipeLine[]
+  components      PrepComponent[]       @relation("PrepOutput")
+  usedAsComponent PrepComponent[]       @relation("PrepComponent")
+  batches         ProductionBatch[]
+  batchLines      ProductionBatchLine[]
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([businessId, name])
+  @@index([businessId, isActive])
+  @@map("ingredients")
+}
+
+// Same idea as InventoryMovement: every ingredient quantity change has a row.
+model IngredientMovement {
+  id               String                 @id @default(uuid())
+  businessId       String
+  business         Business               @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  ingredientId     String
+  ingredient       Ingredient             @relation(fields: [ingredientId], references: [id], onDelete: Cascade)
+
+  type             IngredientMovementType
+  quantityChange   Decimal                @db.Decimal(14, 3)
+  previousQuantity Decimal                @db.Decimal(14, 3)
+  newQuantity      Decimal                @db.Decimal(14, 3)
+  unitCost         Decimal                @db.Decimal(14, 4) @default(0) // cost per unit at the time, so waste/loss can be valued later
+
+  reason           String?
+  reference        String?
+  userId           String?
+
+  createdAt        DateTime               @default(now())
+
+  @@index([businessId, ingredientId, createdAt])
+  @@index([businessId, type, createdAt])
+  @@map("ingredient_movements")
+}
+
+// "One Pepperoni Pizza - Medium uses 0.05 kg cheese". A product with at least
+// one recipe line is stocked by its ingredients instead of by its own quantity.
+model RecipeLine {
+  id           String     @id @default(uuid())
+  productId    String
+  product      Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+  ingredientId String
+  ingredient   Ingredient @relation(fields: [ingredientId], references: [id], onDelete: Restrict)
+  quantity     Decimal    @db.Decimal(14, 4) // per ONE unit sold
+
+  @@unique([productId, ingredientId])
+  @@index([ingredientId])
+  @@map("recipe_lines")
+}
+
+// The standard make-up of a prepared ingredient, per ONE unit of it:
+// "1 Dough ball - Medium = 0.15 kg flour + 0.09 l water + ...".
+model PrepComponent {
+  id          String     @id @default(uuid())
+  outputId    String
+  output      Ingredient @relation("PrepOutput", fields: [outputId], references: [id], onDelete: Cascade)
+  componentId String
+  component   Ingredient @relation("PrepComponent", fields: [componentId], references: [id], onDelete: Restrict)
+  quantity    Decimal    @db.Decimal(14, 4)
+
+  @@unique([outputId, componentId])
+  @@map("prep_components")
+}
+
+// The stock journal: one production run (e.g. "made 40 medium dough balls").
+model ProductionBatch {
+  id               String                @id @default(uuid())
+  businessId       String
+  business         Business              @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  outputId         String
+  output           Ingredient            @relation(fields: [outputId], references: [id], onDelete: Restrict)
+  quantityProduced Decimal               @db.Decimal(14, 3)
+  totalCost        Decimal               @db.Decimal(14, 2) @default(0)
+  notes            String?
+  producedById     String?
+
+  lines            ProductionBatchLine[]
+  createdAt        DateTime              @default(now())
+
+  @@index([businessId, createdAt])
+  @@map("production_batches")
+}
+
+model ProductionBatchLine {
+  id               String          @id @default(uuid())
+  batchId          String
+  batch            ProductionBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  ingredientId     String
+  ingredient       Ingredient      @relation(fields: [ingredientId], references: [id], onDelete: Restrict)
+  quantityUsed     Decimal         @db.Decimal(14, 3)
+  standardQuantity Decimal         @db.Decimal(14, 3) @default(0) // what the standard make-up says it should have used
+  unitCost         Decimal         @db.Decimal(14, 4) @default(0)
+
+  @@index([batchId])
+  @@map("production_batch_lines")
+}
+
+// A physical stock take. expected is a snapshot at the moment the count was
+// started; a manager approves it, which adjusts stock by (counted - expected)
+// and books the net loss/gain to the ledger.
+model StockCount {
+  id                 String           @id @default(uuid())
+  businessId         String
+  business           Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  status             StockCountStatus @default(DRAFT)
+  scope              String           @default("ALL")
+  notes              String?
+  countedById        String
+  submittedAt        DateTime?
+  reviewedById       String?
+  reviewedAt         DateTime?
+  reviewNote         String?
+  totalVarianceValue Decimal?         @db.Decimal(14, 2)
+  journalEntryId     String?
+
+  lines              StockCountLine[]
+  createdAt          DateTime         @default(now())
+
+  @@index([businessId, status])
+  @@index([businessId, createdAt])
+  @@map("stock_counts")
+}
+
+model StockCountLine {
+  id            String        @id @default(uuid())
+  countId       String
+  count         StockCount    @relation(fields: [countId], references: [id], onDelete: Cascade)
+
+  itemType      StockItemType
+  productId     String?       // plain ids: the line is a snapshot and must outlive the item
+  ingredientId  String?
+  itemName      String
+  unit          String
+  expected      Decimal       @db.Decimal(14, 3)
+  counted       Decimal?      @db.Decimal(14, 3)
+  variance      Decimal?      @db.Decimal(14, 3)
+  unitCost      Decimal       @db.Decimal(14, 4) @default(0)
+  varianceValue Decimal?      @db.Decimal(14, 2)
+
+  @@index([countId])
+  @@map("stock_count_lines")
+}
+
+// ---------------------------------------------------------------------------
+// Cashier shifts and handover
+// ---------------------------------------------------------------------------
+
+enum ShiftStatus {
+  OPEN
+  CLOSED
+}
+
+// One cashier's turn on a till. The outgoing cashier counts the drawer
+// (counted vs expected = variance); the incoming cashier recounts when they
+// take over, and any gap between the two is the handoverDifference.
+// Shift variances are for accountability: the ledger is posted once, at day
+// end, from the physical drawer count, so nothing is booked twice.
+model Shift {
+  id         String      @id @default(uuid())
+  businessId String
+  business   Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User        @relation(fields: [userId], references: [id])
+
+  status     ShiftStatus @default(OPEN)
+  openedAt   DateTime    @default(now())
+  openingFloat Decimal   @db.Decimal(12, 2) @default(0)
+  openNotes  String?
+  openedById String? // set when a manager opened this shift FOR the cashier
+
+  // Taking over from a colleague's closed shift.
+  takeOverFromId     String?
+  handoverDifference Decimal? @db.Decimal(12, 2) // incoming float - outgoing counted cash
+  takenOver          Boolean  @default(false)     // set on a CLOSED shift once someone has taken over from it
+
+  closedAt     DateTime?
+  expectedCash Decimal?  @db.Decimal(12, 2)
+  countedCash  Decimal?  @db.Decimal(12, 2)
+  variance     Decimal?  @db.Decimal(12, 2)
+  closeNotes   String?
+  salesCount   Int?
+  salesTotal   Decimal?  @db.Decimal(12, 2)
+
+  @@index([businessId, status])
+  @@index([businessId, openedAt])
+  @@index([userId, status])
+  @@map("shifts")
+}

@@ -1,0 +1,31 @@
+# Render Blueprint: describes the API service so it can be created in one click.
+# Secrets are listed with sync: false, so Render asks for them and they are
+# never stored in git.
+services:
+  - type: web
+    name: salespoint-api
+    runtime: docker
+    plan: free            # change to "starter" before real customers: free services sleep when idle
+    region: frankfurt     # closest to your Supabase project (eu-central-1)
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        sync: false
+      - key: JWT_REFRESH_SECRET
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: PASSWORD_RESET_BASE_URL
+        sync: false
+      - key: PAYSTACK_CALLBACK_URL
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_EMAIL
+        sync: false
