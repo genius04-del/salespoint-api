@@ -40,7 +40,8 @@ const db = vi.hoisted(() => {
     delete: async ({ where }: any) => void (t[name] = table(name).filter((r) => r.id !== where.id)),
     deleteMany: async ({ where }: any) => void (t[name] = table(name).filter((r) => !matches(r, where))),
   });
-  return { t, table, model, reset: () => { for (const k of Object.keys(t)) t[k] = []; } };
+  const counter = { journalNo: 0 };
+  return { t, table, model, counter, reset: () => { counter.journalNo = 0; for (const k of Object.keys(t)) t[k] = []; } };
 });
 
 vi.mock("../../config/prisma", () => {
@@ -52,7 +53,11 @@ vi.mock("../../config/prisma", () => {
   };
   const prisma: any = {
     $transaction: async (fn: any) => fn(prisma),
-    business: { findUnique: async () => ({ restaurantModeEnabled: true }) },
+    business: {
+      findUnique: async () => ({ restaurantModeEnabled: true }),
+      // The journal-number counter: bumped on every run.
+      update: async () => ({ productionCounter: ++db.counter.journalNo }),
+    },
     stockCount,
     stockCountLine: db.model("stockCountLine"),
     product: db.model("product"),
@@ -223,10 +228,38 @@ describe("production (stock journal)", () => {
   it("records what was really used and keeps the standard beside it", async () => {
     await request(app).post("/production").set(COOK).send({
       outputId: "dough", quantity: 40, lines: [{ ingredientId: "flour", quantityUsed: 6.5 }],
+      reason: "Bag was damp",
     });
     const line = db.table("productionBatchLine")[0];
     expect(Number(line.quantityUsed)).toBe(6.5);
     expect(Number(line.standardQuantity)).toBe(6);
+  });
+
+  it("demands a reason when more was used than the recipe says", async () => {
+    const res = await request(app).post("/production").set(COOK).send({
+      outputId: "dough", quantity: 40, lines: [{ ingredientId: "flour", quantityUsed: 6.5 }],
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/say why/i);
+    expect(db.table("productionBatch")).toHaveLength(0);
+    expect(String(db.table("ingredient").find((i) => i.id === "flour")!.currentQuantity)).toBe("10");
+  });
+
+  it("needs no reason when the kitchen used the standard amount or less", async () => {
+    const res = await request(app).post("/production").set(COOK).send({
+      outputId: "dough", quantity: 40, lines: [{ ingredientId: "flour", quantityUsed: 5.9 }],
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it("numbers the journal entries in order and keeps the reason", async () => {
+    const a = await request(app).post("/production").set(COOK).send({ outputId: "dough", quantity: 1 });
+    const b = await request(app).post("/production").set(COOK).send({
+      outputId: "dough", quantity: 10, lines: [{ ingredientId: "flour", quantityUsed: 2 }], reason: "Spilled some",
+    });
+    expect(a.body.batch.number).toBe(1);
+    expect(b.body.batch.number).toBe(2);
+    expect(b.body.batch.reason).toBe("Spilled some");
   });
 
   it("refuses to use more than is in stock unless told to", async () => {

@@ -135,7 +135,11 @@ router.get("/", requirePermission("sales.view", "sales.create", "kitchen.manage"
     orderBy: { createdAt: "desc" },
     take: 200,
   });
-  return res.json({ orders });
+  // Who opened each tab, so the kitchen and the floor know whose it is.
+  const ids = [...new Set(orders.map((o: any) => o.createdById))] as string[];
+  const users = ids.length ? await prisma.user.findMany({ where: { id: { in: ids }, businessId: req.auth!.businessId }, select: { id: true, name: true } }) : [];
+  const nameById = new Map(users.map((u: any) => [u.id, u.name]));
+  return res.json({ orders: orders.map((o: any) => ({ ...o, createdByName: nameById.get(o.createdById) ?? null })) });
 });
 
 // ---- GET /orders/:id ----

@@ -113,6 +113,8 @@ model Business {
   businessType String   @default("general") // e.g. provision_store, restaurant, electronics
   isActive     Boolean  @default(true)
   receiptCounter Int    @default(0) // incremented atomically per sale to generate receipt numbers
+  productionCounter Int @default(0) // incremented atomically per stock journal entry (PJ-0001)
+  dayCounter Int @default(0) // incremented atomically per business day (finance posting FP-0001)
   shortCode String? @unique // the code a cashier types on the till screen, with their staff number and PIN
   requireShift Boolean @default(false) // when true, selling needs an open cashier shift
   requireOpenDay Boolean @default(false) // when true, sales/orders are refused unless a business day is open
@@ -695,6 +697,9 @@ model BusinessDay {
   openedById    String
   openingFloat  Decimal           @db.Decimal(12, 2) @default(0)
   openNotes     String?
+  number        Int               @default(0) // finance posting number, FP-0001
+  openDenominations  Json? // { "50": 4, "0.5": 2 } notes and coins counted for the float
+  closeDenominations Json? // the same, for the cash counted at close
 
   closedAt      DateTime?
   closedById    String?
@@ -767,6 +772,8 @@ model Ingredient {
   name            String
   unit            String   @default("kg")
   isPrepared      Boolean  @default(false)
+  category        String?  // free text: Vegetables, Meat, Packaging... groups the count sheet and variance report
+  batchYield      Decimal? @db.Decimal(14, 3) // prepared items: the standard batch makes this much (components are stored per ONE unit)
   currentQuantity Decimal  @db.Decimal(14, 3) @default(0)
   minStockLevel   Decimal  @db.Decimal(14, 3) @default(0)
   costPerUnit     Decimal  @db.Decimal(14, 4) @default(0) // weighted average
@@ -836,7 +843,7 @@ model PrepComponent {
   output      Ingredient @relation("PrepOutput", fields: [outputId], references: [id], onDelete: Cascade)
   componentId String
   component   Ingredient @relation("PrepComponent", fields: [componentId], references: [id], onDelete: Restrict)
-  quantity    Decimal    @db.Decimal(14, 4)
+  quantity    Decimal    @db.Decimal(14, 6)
 
   @@unique([outputId, componentId])
   @@map("prep_components")
@@ -852,6 +859,8 @@ model ProductionBatch {
   output           Ingredient            @relation(fields: [outputId], references: [id], onDelete: Restrict)
   quantityProduced Decimal               @db.Decimal(14, 3)
   totalCost        Decimal               @db.Decimal(14, 2) @default(0)
+  number           Int                   @default(0) // journal number, per business: PJ-0001
+  reason           String?               // required when more was used than the recipe says
   notes            String?
   producedById     String?
 
@@ -913,6 +922,7 @@ model StockCountLine {
   ingredientId  String?
   itemName      String
   unit          String
+  category      String?
   expected      Decimal       @db.Decimal(14, 3)
   counted       Decimal?      @db.Decimal(14, 3)
   variance      Decimal?      @db.Decimal(14, 3)

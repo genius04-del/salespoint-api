@@ -35,14 +35,14 @@ router.post("/", requirePermission("stock.count"), async (req, res) => {
       : prisma.product.findMany({
           // Dishes made from a recipe are counted through their ingredients.
           where: { businessId, isActive: true, recipeLines: { none: {} } },
-          select: { id: true, name: true, unit: true, currentQuantity: true, costPrice: true },
+          select: { id: true, name: true, unit: true, currentQuantity: true, costPrice: true, category: { select: { name: true } } },
           orderBy: { name: "asc" },
         }),
     scope === "PRODUCTS"
       ? []
       : prisma.ingredient.findMany({
           where: { businessId, isActive: true },
-          select: { id: true, name: true, unit: true, currentQuantity: true, costPerUnit: true },
+          select: { id: true, name: true, unit: true, currentQuantity: true, costPerUnit: true, category: true },
           orderBy: { name: "asc" },
         }),
   ]);
@@ -60,11 +60,11 @@ router.post("/", requirePermission("stock.count"), async (req, res) => {
       lines: {
         create: [
           ...ingredients.map((i: any) => ({
-            itemType: "INGREDIENT" as const, ingredientId: i.id, itemName: i.name, unit: i.unit,
+            itemType: "INGREDIENT" as const, ingredientId: i.id, itemName: i.name, unit: i.unit, category: i.category ?? null,
             expected: i.currentQuantity, unitCost: i.costPerUnit,
           })),
           ...products.map((p: any) => ({
-            itemType: "PRODUCT" as const, productId: p.id, itemName: p.name, unit: p.unit,
+            itemType: "PRODUCT" as const, productId: p.id, itemName: p.name, unit: p.unit, category: p.category?.name ?? null,
             expected: p.currentQuantity, unitCost: p.costPrice,
           })),
         ],

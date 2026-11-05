@@ -151,11 +151,17 @@ router.post("/checkout", requirePermission("sales.create"), async (req, res) => 
 });
 
 // ---- GET /sales ----
-// Query params: from, to (ISO dates), cashierId
+// Query params: from, to (ISO dates), cashierId, status (COMPLETED|CANCELLED),
+// paymentMethod, q (receipt number contains)
 router.get("/", requirePermission("sales.view"), async (req, res) => {
-  const { from, to, cashierId } = req.query;
+  const { from, to, cashierId, status, paymentMethod, q } = req.query;
   const where: any = { businessId: req.auth!.businessId };
   if (cashierId) where.cashierId = String(cashierId);
+  if (status === "COMPLETED" || status === "CANCELLED") where.status = status;
+  if (typeof paymentMethod === "string" && ["CASH", "MOBILE_MONEY", "BANK_TRANSFER", "PAYSTACK", "OTHER"].includes(paymentMethod)) {
+    where.paymentMethod = paymentMethod;
+  }
+  if (typeof q === "string" && q.trim()) where.receiptNumber = { contains: q.trim(), mode: "insensitive" };
   if (from || to) {
     where.createdAt = {};
     if (from) where.createdAt.gte = new Date(String(from));
@@ -164,9 +170,9 @@ router.get("/", requirePermission("sales.view"), async (req, res) => {
 
   const sales = await prisma.sale.findMany({
     where,
-    include: { cashier: { select: { id: true, name: true } } },
+    include: { cashier: { select: { id: true, name: true } }, _count: { select: { items: true } }, order: { select: { table: { select: { name: true } } } } },
     orderBy: { createdAt: "desc" },
-    take: 200,
+    take: 500,
   });
 
   return res.json({ sales });

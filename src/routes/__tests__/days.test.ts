@@ -14,6 +14,7 @@ const state = vi.hoisted(() => ({
   journals: [] as any[],
   accounts: [] as any[],
   requireOpenDay: false,
+  dayCounter: 0,
 }));
 
 vi.mock("../../config/prisma", () => {
@@ -22,7 +23,7 @@ vi.mock("../../config/prisma", () => {
     $transaction: async (fn: any) => fn(prisma),
     business: {
       findUnique: async () => ({ requireOpenDay: state.requireOpenDay, restaurantModeEnabled: false }),
-      update: async () => ({}),
+      update: async () => ({ dayCounter: ++state.dayCounter }),
     },
     businessDay: {
       findFirst: async (args: any) => {
@@ -121,6 +122,7 @@ beforeEach(() => {
     { id: "a1000", code: "1000" }, { id: "a1010", code: "1010" }, { id: "a1020", code: "1020" },
   ];
   state.requireOpenDay = false;
+  state.dayCounter = 0;
 });
 
 async function openDay(float = 100) {
@@ -140,6 +142,30 @@ describe("opening the day", () => {
   it("a user without day.open cannot open it", async () => {
     const res = await request(app).post("/days/open").set({ "x-perms": "day.view" }).send({});
     expect(res.status).toBe(403);
+  });
+});
+
+describe("finance posting numbers and notes/coins", () => {
+  it("numbers each day FP-style, one after another", async () => {
+    const first = await openDay(0);
+    expect(first.body.day.number).toBe(1);
+  });
+
+  it("keeps the notes and coins counted for the float, and refuses a count that does not add up", async () => {
+    const bad = await request(app).post("/days/open").set(MANAGER).send({ openingFloat: 100, denominations: { "50": 1, "20": 1 } });
+    expect(bad.status).toBe(400);
+    const ok = await request(app).post("/days/open").set(MANAGER).send({ openingFloat: 100, denominations: { "50": 1, "20": 2, "5": 2, "0.5": 0 } });
+    expect(ok.status).toBe(201);
+    expect(ok.body.day.openDenominations).toEqual({ "50": 1, "20": 2, "5": 2 });
+  });
+
+  it("keeps the notes and coins counted at close, and checks them against the cash counted", async () => {
+    await openDay(100);
+    const bad = await request(app).post("/days/close").set(MANAGER).send({ counts: [{ method: "CASH", counted: 100 }], denominations: { "50": 1 } });
+    expect(bad.status).toBe(400);
+    const ok = await request(app).post("/days/close").set(MANAGER).send({ counts: [{ method: "CASH", counted: 100 }], denominations: { "50": 2 } });
+    expect(ok.status).toBe(200);
+    expect(ok.body.day.closeDenominations).toEqual({ "50": 2 });
   });
 });
 

@@ -96,3 +96,112 @@ export function rollUpProductionUsage(rows: BatchLineRow[]) {
     .filter((e) => e.overUse !== 0)
     .sort((a, b) => b.value - a.value);
 }
+
+// ---------------------------------------------------------------------------
+// Period report: opening -> in/out/waste -> theoretical closing -> actual
+// closing -> variance, per item.
+//
+// "Theoretical closing" is what the system says should be on the shelf if
+// nothing went missing; "actual closing" is what is there after the physical
+// counts were approved. The difference is the variance, i.e. the count
+// adjustments. An item that was never counted in the period has no actual
+// closing and no variance.
+// ---------------------------------------------------------------------------
+
+export interface ReportItem {
+  itemType: "PRODUCT" | "INGREDIENT";
+  itemId: string;
+  name: string;
+  unit: string;
+  category: string | null;
+  currentQuantity: Prisma.Decimal.Value;
+  unitCost: Prisma.Decimal.Value;
+}
+
+export interface ReportMovement {
+  itemId: string;
+  kind: "COUNT" | "WASTE" | "OTHER"; // COUNT = a stock-count adjustment, WASTE = written off / damaged
+  change: Prisma.Decimal.Value; // signed
+  previous: Prisma.Decimal.Value;
+  next: Prisma.Decimal.Value;
+  at: Date;
+}
+
+export interface MovementReportRow {
+  itemType: "PRODUCT" | "INGREDIENT";
+  itemId: string;
+  name: string;
+  unit: string;
+  category: string | null;
+  opening: number;
+  stockIn: number;
+  stockOut: number;
+  waste: number;
+  theoreticalClosing: number;
+  actualClosing: number | null;
+  variance: number | null; // negative = missing
+  varianceValue: number | null;
+  counted: boolean;
+}
+
+const r3 = (d: Prisma.Decimal) => d.toDecimalPlaces(3).toNumber();
+
+export function buildMovementReport(
+  items: ReportItem[],
+  movements: ReportMovement[],
+  countedItemIds: Set<string>,
+  from: Date,
+  to: Date
+): MovementReportRow[] {
+  const byItem = new Map<string, ReportMovement[]>();
+  movements.forEach((m) => {
+    if (m.at < from) return; // only what happened from the start of the period on matters
+    byItem.set(m.itemId, [...(byItem.get(m.itemId) ?? []), m]);
+  });
+
+  const rows: MovementReportRow[] = [];
+  for (const item of items) {
+    const all = (byItem.get(item.itemId) ?? []).slice().sort((a, b) => a.at.getTime() - b.at.getTime());
+    const inRange = all.filter((m) => m.at <= to);
+    // Quantity at the start of the period: what the first movement started from,
+    // or, if nothing has moved since, what is on the shelf now.
+    const opening = all.length ? D(all[0].previous) : D(item.currentQuantity);
+    const closing = inRange.length ? D(inRange[inRange.length - 1].next) : opening;
+
+    let stockIn = D(0);
+    let stockOut = D(0);
+    let waste = D(0);
+    let countAdj = D(0);
+    for (const m of inRange) {
+      const c = D(m.change);
+      if (m.kind === "COUNT") countAdj = countAdj.add(c);
+      else if (m.kind === "WASTE") waste = waste.add(c.abs());
+      else if (c.isNegative()) stockOut = stockOut.add(c.abs());
+      else stockIn = stockIn.add(c);
+    }
+
+    const counted = countedItemIds.has(item.itemId);
+    if (!counted && inRange.length === 0 && opening.isZero()) continue; // nothing to report
+
+    const variance = counted ? countAdj : null;
+    rows.push({
+      itemType: item.itemType,
+      itemId: item.itemId,
+      name: item.name,
+      unit: item.unit,
+      category: item.category,
+      opening: r3(opening),
+      stockIn: r3(stockIn),
+      stockOut: r3(stockOut),
+      waste: r3(waste),
+      theoreticalClosing: r3(closing.sub(countAdj)),
+      actualClosing: counted ? r3(closing) : null,
+      variance: variance ? r3(variance) : counted ? 0 : null,
+      varianceValue: variance ? variance.mul(D(item.unitCost)).toDecimalPlaces(2).toNumber() : counted ? 0 : null,
+      counted,
+    });
+  }
+  return rows.sort(
+    (a, b) => (a.category ?? "~").localeCompare(b.category ?? "~") || a.name.localeCompare(b.name)
+  );
+}

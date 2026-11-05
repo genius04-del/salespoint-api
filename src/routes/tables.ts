@@ -76,4 +76,24 @@ router.patch("/:id", requirePermission("tables.manage"), async (req, res) => {
   return res.json({ table: updated });
 });
 
+// ---- POST /tables/:id/status ----
+// Anyone who serves tables can flip a table's state (e.g. mark it clean after
+// a customer leaves). Renaming or removing a table still needs tables.manage.
+router.post("/:id/status", requirePermission("tables.manage", "sales.create", "kitchen.manage"), async (req, res) => {
+  const parsed = z.object({ status: z.enum(["AVAILABLE", "OCCUPIED", "RESERVED", "NEEDS_CLEANING"]) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  const table = await prisma.table.findFirst({ where: { id: req.params.id, businessId: req.auth!.businessId } });
+  if (!table) return res.status(404).json({ error: "Table not found" });
+
+  // A table with a running tab cannot be released.
+  if (parsed.data.status === "AVAILABLE") {
+    const open = await prisma.order.findFirst({ where: { tableId: table.id, status: "OPEN" }, select: { id: true } });
+    if (open) return res.status(409).json({ error: "This table still has an open tab. Pay or cancel it first." });
+  }
+
+  const updated = await prisma.table.update({ where: { id: table.id }, data: { status: parsed.data.status } });
+  return res.json({ table: updated });
+});
+
 export default router;

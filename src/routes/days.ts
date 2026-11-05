@@ -38,6 +38,16 @@ async function lockBusiness(tx: Prisma.TransactionClient, businessId: string) {
 
 const num = (d: Prisma.Decimal | number | null | undefined) => (d == null ? null : Number(d));
 
+// Notes and coins counted: { "50": 4, "0.5": 2 } = four GH₵50 notes, two 50p coins.
+const denominationsSchema = z.record(z.string().regex(/^\d+(\.\d{1,2})?$/), z.number().int().min(0).max(100000));
+const denominationTotal = (d: Record<string, number>) =>
+  round2(Object.entries(d).reduce((sum, [value, count]) => sum + Number(value) * count, 0));
+const cleanDenominations = (d?: Record<string, number>) => {
+  if (!d) return undefined;
+  const kept = Object.fromEntries(Object.entries(d).filter(([, n]) => n > 0));
+  return Object.keys(kept).length > 0 ? kept : undefined;
+};
+
 async function userNames(ids: (string | null | undefined)[]) {
   const unique = [...new Set(ids.filter((i): i is string => !!i))];
   if (unique.length === 0) return new Map<string, string>();
@@ -48,11 +58,14 @@ async function userNames(ids: (string | null | undefined)[]) {
 function serializeDay(day: any, names: Map<string, string>) {
   return {
     id: day.id,
+    number: day.number ?? 0,
     status: day.status as "OPEN" | "CLOSED",
     openedAt: day.openedAt,
     openedBy: names.get(day.openedById) ?? "Unknown",
     openingFloat: num(day.openingFloat) ?? 0,
     openNotes: day.openNotes,
+    openDenominations: (day.openDenominations as Record<string, number> | null) ?? null,
+    closeDenominations: (day.closeDenominations as Record<string, number> | null) ?? null,
     closedAt: day.closedAt,
     closedBy: day.closedById ? names.get(day.closedById) ?? "Unknown" : null,
     closeNotes: day.closeNotes,
@@ -128,12 +141,17 @@ router.get("/current", requirePermission("day.view", "day.open", "day.close"), a
 const openSchema = z.object({
   openingFloat: z.number().min(0).default(0), // cash already in the drawer
   notes: z.string().max(500).optional(),
+  denominations: denominationsSchema.optional(), // the notes and coins that make up the float
 });
 
 router.post("/open", requirePermission("day.open"), async (req, res) => {
   const parsed = openSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
   const { businessId, userId } = req.auth!;
+  const openDenoms = cleanDenominations(parsed.data.denominations);
+  if (openDenoms && Math.abs(denominationTotal(openDenoms) - parsed.data.openingFloat) > 0.005) {
+    return res.status(400).json({ error: "The notes and coins you counted do not add up to the float." });
+  }
 
   try {
     const day = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
@@ -142,12 +160,19 @@ router.post("/open", requirePermission("day.open"), async (req, res) => {
       if (existing) {
         throw new HttpError(409, { error: "A business day is already open. Close it before opening a new one.", code: "DAY_ALREADY_OPEN" });
       }
+      const counter = await tx.business.update({
+        where: { id: businessId },
+        data: { dayCounter: { increment: 1 } },
+        select: { dayCounter: true },
+      });
       return tx.businessDay.create({
         data: {
           businessId,
+          number: counter.dayCounter,
           openedById: userId,
           openingFloat: parsed.data.openingFloat,
           openNotes: parsed.data.notes?.trim() || null,
+          ...(openDenoms ? { openDenominations: openDenoms } : {}),
         },
       });
     });
@@ -180,6 +205,7 @@ const closeSchema = z.object({
     .max(COUNTED_METHODS.length),
   notes: z.string().max(1000).optional(),
   acceptVariance: z.boolean().default(false),
+  denominations: denominationsSchema.optional(), // the notes and coins that make up the counted cash
 });
 
 router.post("/close", requirePermission("day.close"), async (req, res) => {
@@ -188,6 +214,13 @@ router.post("/close", requirePermission("day.close"), async (req, res) => {
   const { counts, acceptVariance } = parsed.data;
   const notes = parsed.data.notes?.trim() || "";
   const { businessId, userId } = req.auth!;
+  const closeDenoms = cleanDenominations(parsed.data.denominations);
+  if (closeDenoms) {
+    const cash = counts.find((c) => c.method === "CASH")?.counted ?? 0;
+    if (Math.abs(denominationTotal(closeDenoms) - cash) > 0.005) {
+      return res.status(400).json({ error: "The notes and coins you counted do not add up to the cash amount." });
+    }
+  }
 
   if (new Set(counts.map((c) => c.method)).size !== counts.length) {
     return res.status(400).json({ error: "Each payment method can only be counted once." });
@@ -270,6 +303,7 @@ router.post("/close", requirePermission("day.close"), async (req, res) => {
           closedAt,
           closedById: userId,
           closeNotes: notes || null,
+          ...(closeDenoms ? { closeDenominations: closeDenoms } : {}),
           totalExpected: rec.totalExpected,
           totalCounted: rec.totalCounted,
           totalVariance: rec.totalVariance,

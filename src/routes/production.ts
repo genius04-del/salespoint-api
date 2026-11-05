@@ -41,7 +41,10 @@ router.get("/preview", requirePermission("stock.view", "stock.produce"), async (
       enough: new Prisma.Decimal(ing.currentQuantity).greaterThanOrEqualTo(l.quantity),
     };
   });
-  return res.json({ output: { id: std.output.id, name: std.output.name, unit: std.output.unit }, lines });
+  return res.json({
+    output: { id: std.output.id, name: std.output.name, unit: std.output.unit, batchYield: std.output.batchYield?.toString() ?? null },
+    lines,
+  });
 });
 
 // ---- POST /production ---- record a run (the stock journal entry)
@@ -51,6 +54,8 @@ const runSchema = z.object({
   // Optional: what was REALLY used, if it differs from the standard make-up.
   lines: z.array(z.object({ ingredientId: z.string(), quantityUsed: z.number().min(0).max(1_000_000) })).max(50).optional(),
   notes: z.string().max(300).optional(),
+  // Required when the kitchen used more than the recipe says (a poor yield).
+  reason: z.string().trim().max(300).optional(),
   allowShortage: z.boolean().default(false),
 });
 
@@ -59,6 +64,7 @@ router.post("/", requirePermission("stock.produce"), async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
   const businessId = req.auth!.businessId;
   const { outputId, quantity, notes, allowShortage } = parsed.data;
+  const reason = parsed.data.reason || undefined;
 
   try {
     const batch = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
@@ -76,8 +82,21 @@ router.post("/", requirePermission("stock.produce"), async (req, res) => {
       if (used.length === 0) throw new Error("NO_MAKEUP");
       if (new Set(used.map((u) => u.ingredientId)).has(outputId)) throw new Error("SELF_USE");
 
+      // Used more than the recipe allows (0.1% slack for rounding)? Then someone has to say why.
+      const overUsed = used.some((u) => {
+        const std = standardById.get(u.ingredientId);
+        return std !== undefined && new Prisma.Decimal(std).greaterThan(0) && u.quantityUsed.greaterThan(new Prisma.Decimal(std).mul(1.001));
+      });
+      if (overUsed && !reason) throw new Error("REASON_REQUIRED");
+
+      // Journal number: bumped atomically, so two cooks saving at once never share one.
+      const counter = await tx.business.update({
+        where: { id: businessId },
+        data: { productionCounter: { increment: 1 } },
+        select: { productionCounter: true },
+      });
       const batch = await tx.productionBatch.create({
-        data: { businessId, outputId, quantityProduced: quantity, notes, producedById: req.auth!.userId },
+        data: { businessId, outputId, quantityProduced: quantity, notes, reason, number: counter.productionCounter, producedById: req.auth!.userId },
       });
 
       let totalCost = new Prisma.Decimal(0);
@@ -114,6 +133,7 @@ router.post("/", requirePermission("stock.produce"), async (req, res) => {
     await recordAudit({ businessId, userId: req.auth!.userId, action: "PRODUCTION_RECORDED", entity: "ProductionBatch", entityId: batch.id, metadata: { outputId, quantity } });
     return res.status(201).json({ batch });
   } catch (err: any) {
+    if (err.message === "REASON_REQUIRED") return res.status(400).json({ error: "More was used than the recipe says. Say why (for example: bag was bony, spilled, over-trimmed)." });
     if (err.message === "NOT_PREPARED") return res.status(400).json({ error: "Only prepared items can be produced" });
     if (err.message === "NO_MAKEUP") return res.status(400).json({ error: "This item has no make-up yet. Set what it is made from first, or enter the amounts used." });
     if (err.message === "SELF_USE") return res.status(400).json({ error: "A prepared item can't be made from itself" });

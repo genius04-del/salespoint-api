@@ -42,6 +42,7 @@ const createSchema = z.object({
   name: z.string().trim().min(1).max(100),
   unit: z.string().trim().min(1).max(20).default("kg"),
   isPrepared: z.boolean().default(false),
+  category: z.string().trim().max(40).optional(),
   minStockLevel: z.number().min(0).default(0),
   costPerUnit: z.number().min(0).default(0),
   openingQuantity: z.number().min(0).default(0),
@@ -63,6 +64,7 @@ router.post("/", requirePermission("stock.manage"), async (req, res) => {
         name: d.name,
         unit: d.unit,
         isPrepared: d.isPrepared,
+        category: d.category || null,
         minStockLevel: d.minStockLevel,
         costPerUnit: d.costPerUnit,
       },
@@ -89,6 +91,7 @@ router.post("/", requirePermission("stock.manage"), async (req, res) => {
 const patchSchema = z.object({
   name: z.string().trim().min(1).max(100).optional(),
   unit: z.string().trim().min(1).max(20).optional(),
+  category: z.string().trim().max(40).nullable().optional(),
   minStockLevel: z.number().min(0).optional(),
   costPerUnit: z.number().min(0).optional(),
   isActive: z.boolean().optional(),
@@ -108,7 +111,11 @@ router.patch("/:id", requirePermission("stock.manage"), async (req, res) => {
   }
 
   const ingredient = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-    const updated = await tx.ingredient.update({ where: { id: existing.id }, data: parsed.data });
+    const { category, ...rest } = parsed.data;
+    const updated = await tx.ingredient.update({
+      where: { id: existing.id },
+      data: { ...rest, ...(category !== undefined ? { category: category || null } : {}) },
+    });
     if (parsed.data.costPerUnit !== undefined) await syncProductsUsingIngredient(tx, existing.id);
     return updated;
   });
@@ -118,8 +125,12 @@ router.patch("/:id", requirePermission("stock.manage"), async (req, res) => {
 });
 
 // ---- PUT /ingredients/:id/prep ----
-// The standard make-up of a prepared item, per ONE unit of it.
+// The standard recipe of a prepared item. Send it the way a cook thinks:
+// "this batch makes 1.5 kg from 2 kg raw steak + ..." (batchYield + quantities
+// for the whole batch). Without batchYield the quantities are per ONE unit.
+// Either way it is stored per unit, so production maths stays the same.
 const prepSchema = z.object({
+  batchYield: z.number().positive().max(1_000_000).optional(),
   components: z
     .array(z.object({ ingredientId: z.string(), quantity: z.number().positive().max(1_000_000) }))
     .max(50),
@@ -156,9 +167,14 @@ router.put("/:id/prep", requirePermission("stock.manage"), async (req, res) => {
     await tx.prepComponent.deleteMany({ where: { outputId: output.id } });
     if (parsed.data.components.length) {
       await tx.prepComponent.createMany({
-        data: parsed.data.components.map((c) => ({ outputId: output.id, componentId: c.ingredientId, quantity: c.quantity })),
+        data: parsed.data.components.map((c) => ({
+          outputId: output.id,
+          componentId: c.ingredientId,
+          quantity: new Prisma.Decimal(c.quantity).div(parsed.data.batchYield ?? 1).toDecimalPlaces(6),
+        })),
       });
     }
+    await tx.ingredient.update({ where: { id: output.id }, data: { batchYield: parsed.data.batchYield ?? null } });
   });
 
   await recordAudit({ businessId, userId: req.auth!.userId, action: "PREP_RECIPE_SET", entity: "Ingredient", entityId: output.id });
@@ -166,7 +182,7 @@ router.put("/:id/prep", requirePermission("stock.manage"), async (req, res) => {
     where: { outputId: output.id },
     include: { component: { select: { id: true, name: true, unit: true } } },
   });
-  return res.json({ components });
+  return res.json({ components, batchYield: parsed.data.batchYield ?? null });
 });
 
 // ---- POST /ingredients/:id/receive ---- stock coming in (a delivery / market run)
