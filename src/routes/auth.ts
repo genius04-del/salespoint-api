@@ -22,15 +22,21 @@ type TokenUser = {
   extraPermissions: string[];
   revokedPermissions: string[];
   tokenVersion: number;
+  groupAdminId?: string | null;
+  activeBusinessId?: string | null;
 };
 
 // The access token carries the user's effective permissions, so a change to a
 // user's permissions takes effect when their token is next issued (at login,
 // or on refresh — at most 15 minutes later).
-function accessTokenFor(user: TokenUser) {
+// A chain owner works inside the branch they last switched to.
+export const effectiveBusinessId = (user: TokenUser) =>
+  user.groupAdminId && user.activeBusinessId ? user.activeBusinessId : user.businessId;
+
+export function accessTokenFor(user: TokenUser) {
   return signAccessToken({
     userId: user.id,
-    businessId: user.businessId,
+    businessId: effectiveBusinessId(user),
     role: user.role,
     permissions: effectivePermissions(user.role, user.extraPermissions, user.revokedPermissions),
   });
@@ -152,7 +158,7 @@ router.post("/login", async (req, res) => {
   });
 
   return res.json({
-    user: { id: user.id, name: user.name, email: user.email, role: user.role, businessId: user.businessId },
+    user: { id: user.id, name: user.name, email: user.email, role: user.role, businessId: effectiveBusinessId(user) },
     accessToken,
     refreshToken,
   });
@@ -325,7 +331,8 @@ router.get("/me", authenticate, async (req, res) => {
     select: { id: true, name: true, email: true, role: true, businessId: true, phone: true },
   });
   if (!user) return res.status(404).json({ error: "User not found" });
-  return res.json({ user, permissions: req.auth!.permissions });
+  // The branch the token is for, which may not be the user's home business.
+  return res.json({ user: { ...user, businessId: req.auth!.businessId }, permissions: req.auth!.permissions });
 });
 
 export default router;

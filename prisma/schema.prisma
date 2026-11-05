@@ -7,6 +7,12 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// A production branch (central kitchen) prepares and sends out stock; it never sells.
+enum BranchType {
+  OUTLET
+  PRODUCTION
+}
+
 enum Role {
   OWNER
   MANAGER
@@ -114,6 +120,9 @@ model Business {
   isActive     Boolean  @default(true)
   receiptCounter Int    @default(0) // incremented atomically per sale to generate receipt numbers
   productionCounter Int @default(0) // incremented atomically per stock journal entry (PJ-0001)
+  groupId String? // set when this business is one branch of a group (chain)
+  group   BusinessGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  branchType BranchType @default(OUTLET)
   dayCounter Int @default(0) // incremented atomically per business day (finance posting FP-0001)
   shortCode String? @unique // the code a cashier types on the till screen, with their staff number and PIN
   requireShift Boolean @default(false) // when true, selling needs an open cashier shift
@@ -154,7 +163,20 @@ model Business {
   productionBatches ProductionBatch[]
   stockCounts StockCount[]
 
+  @@index([groupId])
   @@map("businesses")
+}
+
+// A chain: several businesses (branches) under one owner, with group-wide reports.
+model BusinessGroup {
+  id        String   @id @default(uuid())
+  name      String
+  createdAt DateTime @default(now())
+
+  businesses Business[]
+  admins     User[]     @relation("GroupAdmin")
+
+  @@map("business_groups")
 }
 
 model User {
@@ -174,6 +196,12 @@ model User {
   revokedPermissions String[] @default([])
   // Bumped on logout so every refresh token issued before it stops working.
   tokenVersion       Int      @default(0)
+
+  // A group admin (chain owner) works inside one branch at a time. activeBusinessId
+  // is the branch they are in; empty means their home business.
+  groupAdminId     String?
+  groupAdmin       BusinessGroup? @relation("GroupAdmin", fields: [groupAdminId], references: [id], onDelete: SetNull)
+  activeBusinessId String?
 
   // Forgot-password flow: a hashed, time-limited single-use token.
   // Never store the raw token — only its hash, same principle as a password.

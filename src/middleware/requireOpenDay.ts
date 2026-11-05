@@ -10,8 +10,15 @@ export async function requireOpenDay(req: Request, res: Response, next: NextFunc
 
   const business = await prisma.business.findUnique({
     where: { id: businessId },
-    select: { requireOpenDay: true },
+    select: { requireOpenDay: true, branchType: true },
   });
+  // A production branch (central kitchen) prepares and sends stock out; it never sells.
+  if (business?.branchType === "PRODUCTION") {
+    return res.status(403).json({
+      error: "This is a production branch. It does not sell. Switch to a shop branch to take orders.",
+      code: "PRODUCTION_BRANCH",
+    });
+  }
   if (!business?.requireOpenDay) return next();
 
   const open = await prisma.businessDay.findFirst({

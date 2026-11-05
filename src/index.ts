@@ -32,6 +32,7 @@ import productionRoutes from "./routes/production";
 import stockCountRoutes from "./routes/stockCounts";
 import stockVarianceRoutes from "./routes/stockVariance";
 import { authenticate } from "./middleware/auth";
+import groupRoutes from "./routes/groups";
 import { requireOpenDay } from "./middleware/requireOpenDay";
 import { requireOpenShift } from "./middleware/requireOpenShift";
 import pinAuthRoutes from "./routes/pinAuth";
@@ -138,6 +139,7 @@ app.post("/orders/:id/checkout", authenticate, requireOpenShift);
 app.use("/auth/pin-login", pinAuthRoutes);
 
 app.use("/auth", authRoutes);
+app.use("/groups", groupRoutes);
 app.use("/business", businessRoutes);
 app.use("/staff", userRoutes);
 app.use("/categories", categoryRoutes);
