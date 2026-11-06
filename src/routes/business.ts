@@ -1,8 +1,10 @@
 import { Router } from "express";
 import { z } from "zod";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../config/prisma";
 import { authenticate, authorize } from "../middleware/auth";
 import { recordAudit } from "../utils/audit";
+import { countPendingSales, getDeductionState } from "../services/stockDeduction";
 import { encrypt } from "../services/encryption";
 import { looksLikePaystackPublicKey, looksLikePaystackSecretKey } from "../services/paystack";
 
@@ -26,6 +28,7 @@ const SAFE_BUSINESS_SELECT = {
   businessType: true,
   isActive: true,
   restaurantModeEnabled: true,
+  deductStockAtDayEnd: true,
   receiptCounter: true,
   paystackPublicKey: true,
   paystackConfiguredAt: true,
@@ -59,15 +62,29 @@ const updateSchema = z.object({
   currency: z.string().length(3).optional(),
   businessType: z.string().min(2).optional(),
   restaurantModeEnabled: z.boolean().optional(),
+  deductStockAtDayEnd: z.boolean().optional(),
 });
 
 router.patch("/", authorize("OWNER"), async (req, res) => {
   const parsed = updateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
+  const data: Record<string, unknown> = { ...parsed.data };
+  if (parsed.data.deductStockAtDayEnd !== undefined) {
+    const state = await getDeductionState(prisma as unknown as Prisma.TransactionClient, req.auth!.businessId);
+    if (parsed.data.deductStockAtDayEnd && !state.dayEnd) {
+      data.stockDeductionStart = new Date(); // everything sold so far was already deducted as it happened
+    }
+    if (!parsed.data.deductStockAtDayEnd && state.dayEnd) {
+      const pending = await countPendingSales(prisma as unknown as Prisma.TransactionClient, req.auth!.businessId, state);
+      if (state.pending) return res.status(409).json({ error: `Deduction SD-${String(state.pending.number).padStart(4, "0")} is waiting in Stock Adjustment. Save or cancel it first, then switch this off.` });
+      if (pending > 0) return res.status(409).json({ error: `${pending} sale${pending === 1 ? " is" : "s are"} still waiting to be deducted from stock. Run the deduction first, then switch this off.` });
+    }
+  }
+
   const updated = await prisma.business.update({
     where: { id: req.auth!.businessId },
-    data: parsed.data,
+    data,
     select: SAFE_BUSINESS_SELECT,
   });
 

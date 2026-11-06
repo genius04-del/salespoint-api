@@ -19,12 +19,21 @@ export async function requireOpenDay(req: Request, res: Response, next: NextFunc
       code: "PRODUCTION_BRANCH",
     });
   }
-  if (!business?.requireOpenDay) return next();
-
   const open = await prisma.businessDay.findFirst({
     where: { businessId, status: "OPEN" },
-    select: { id: true },
+    select: { id: true, postedAt: true },
   });
+
+  // Once the finance posting is saved the day's money is counted: nothing more can be
+  // sold into it. (Applies to every business that uses days, not only those that require one.)
+  if (open?.postedAt) {
+    return res.status(409).json({
+      error: "The day has been cashed up (finance posting saved). Close the day and open a new one to keep selling.",
+      code: "DAY_POSTED",
+    });
+  }
+
+  if (!business?.requireOpenDay) return next();
   if (open) return next();
 
   return res.status(409).json({

@@ -13,6 +13,7 @@ import {
   round2,
   DayFigures,
 } from "../services/dayClose";
+import { countPendingSales, getDeductionState } from "../services/stockDeduction";
 
 const router = Router();
 router.use(authenticate);
@@ -59,6 +60,9 @@ function serializeDay(day: any, names: Map<string, string>) {
   return {
     id: day.id,
     number: day.number ?? 0,
+    posted: !!day.postedAt,
+    postedAt: day.postedAt ?? null,
+    postedBy: day.postedById ? names.get(day.postedById) ?? "Unknown" : null,
     status: day.status as "OPEN" | "CLOSED",
     openedAt: day.openedAt,
     openedBy: names.get(day.openedById) ?? "Unknown",
@@ -121,15 +125,35 @@ router.get("/current", requirePermission("day.view", "day.open", "day.close"), a
 
   const now = new Date();
   const figures = await gatherDayFigures(prisma as unknown as Prisma.TransactionClient, businessId, day.openedAt, now);
-  const names = await userNames([day.openedById]);
+  const names = await userNames([day.openedById, day.postedById]);
   const mine = figures.byCashier.find((c) => c.cashierId === userId);
   const openTabs = business?.restaurantModeEnabled
     ? await prisma.order.count({ where: { businessId, status: "OPEN" } })
     : 0;
 
+  // Restaurants: after the finance posting the manager still has stock steps before closing.
+  let stockSteps: { dayEnd: boolean; sales: number; pendingNumber: number | null; counted: boolean } | null = null;
+  if (canSeeAll && business?.restaurantModeEnabled) {
+    const db = prisma as unknown as Prisma.TransactionClient;
+    const ded = await getDeductionState(db, businessId);
+    stockSteps = {
+      dayEnd: ded.dayEnd,
+      sales: ded.dayEnd ? await countPendingSales(db, businessId, ded, now) : 0,
+      pendingNumber: ded.pending?.number ?? null,
+      counted: (await prisma.stockCount.count({ where: { businessId, status: { in: ["SUBMITTED", "APPROVED"] }, createdAt: { gte: day.openedAt } } })) > 0,
+    };
+  }
+  const posting = day.postedAt
+    ? ((await prisma.businessDayCount.findMany({ where: { dayId: day.id } })) as any[]).map((c) => ({
+        method: c.method, expected: round2(Number(c.expected)), counted: round2(Number(c.counted)), variance: round2(Number(c.variance)),
+      }))
+    : null;
+
   return res.json({
     day: serializeDay(day, names),
     requireOpenDay: business?.requireOpenDay ?? false,
+    stockSteps,
+    posting,
     asOf: now,
     openTabs,
     mine: mine ?? { cashierId: userId, name: "You", orders: 0, totals: { CASH: 0, MOBILE_MONEY: 0, BANK_TRANSFER: 0, OTHER: 0, PAYSTACK: 0 } },
@@ -193,13 +217,13 @@ router.post("/open", requirePermission("day.open"), async (req, res) => {
   }
 });
 
-// ---- POST /days/close ---- the cash-up
+// ---- POST /days/post ---- the finance posting (cash-up)
 // The manager sends what they physically counted per method. The server
 // recomputes what was expected AT THIS MOMENT (never trusting a client figure),
 // compares, and only closes if it balances — or if the manager explicitly
 // accepts the difference with a written reason. Differences are posted to the
 // ledger (Cash Over/Short) in the same transaction, so books and drawer agree.
-const closeSchema = z.object({
+const postSchema = z.object({
   counts: z
     .array(z.object({ method: z.enum(COUNTED_METHODS), counted: z.number().min(0) }))
     .max(COUNTED_METHODS.length),
@@ -208,8 +232,8 @@ const closeSchema = z.object({
   denominations: denominationsSchema.optional(), // the notes and coins that make up the counted cash
 });
 
-router.post("/close", requirePermission("day.close"), async (req, res) => {
-  const parsed = closeSchema.safeParse(req.body);
+router.post("/post", requirePermission("day.close"), async (req, res) => {
+  const parsed = postSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
   const { counts, acceptVariance } = parsed.data;
   const notes = parsed.data.notes?.trim() || "";
@@ -231,12 +255,13 @@ router.post("/close", requirePermission("day.close"), async (req, res) => {
       await lockBusiness(tx, businessId);
 
       const day = await tx.businessDay.findFirst({ where: { businessId, status: "OPEN" } });
-      if (!day) throw new HttpError(409, { error: "There is no open business day to close.", code: "NO_OPEN_DAY" });
+      if (!day) throw new HttpError(409, { error: "There is no open business day to post.", code: "NO_OPEN_DAY" });
+      if (day.postedAt) throw new HttpError(409, { error: "The finance posting for this day is already saved.", code: "DAY_ALREADY_POSTED" });
 
       const openTabs = await tx.order.count({ where: { businessId, status: "OPEN" } });
       if (openTabs > 0) {
         throw new HttpError(409, {
-          error: `${openTabs} table tab${openTabs === 1 ? " is" : "s are"} still open. Pay or cancel ${openTabs === 1 ? "it" : "them"} before closing the day.`,
+          error: `${openTabs} table tab${openTabs === 1 ? " is" : "s are"} still open. Pay or cancel ${openTabs === 1 ? "it" : "them"} before the finance posting.`,
           code: "OPEN_TABS",
           openTabs,
         });
@@ -299,9 +324,8 @@ router.post("/close", requirePermission("day.close"), async (req, res) => {
       const closed = await tx.businessDay.update({
         where: { id: day.id },
         data: {
-          status: "CLOSED",
-          closedAt,
-          closedById: userId,
+          postedAt: closedAt,
+          postedById: userId,
           closeNotes: notes || null,
           ...(closeDenoms ? { closeDenominations: closeDenoms } : {}),
           totalExpected: rec.totalExpected,
@@ -316,7 +340,7 @@ router.post("/close", requirePermission("day.close"), async (req, res) => {
     await recordAudit({
       businessId,
       userId,
-      action: "DAY_CLOSED",
+      action: "DAY_POSTED",
       entity: "BusinessDay",
       entityId: result.closed.id,
       metadata: {
@@ -327,7 +351,7 @@ router.post("/close", requirePermission("day.close"), async (req, res) => {
       },
     });
 
-    const names = await userNames([result.closed.openedById, result.closed.closedById]);
+    const names = await userNames([result.closed.openedById, result.closed.postedById]);
     return res.json({
       day: serializeDay(result.closed, names),
       rows: result.rec.rows,
@@ -335,6 +359,49 @@ router.post("/close", requirePermission("day.close"), async (req, res) => {
       paystack: result.figures.salesByMethod.PAYSTACK,
       orders: result.figures.orders,
     });
+  } catch (err) {
+    return sendError(res, err);
+  }
+});
+
+// ---- POST /days/close ---- close the day, last of all
+// Only after the finance posting is saved, and (restaurants that deduct at day end)
+// after the sales were deducted and uploaded. The daily stock count is advised, not forced.
+router.post("/close", requirePermission("day.close"), async (req, res) => {
+  const { businessId, userId } = req.auth!;
+  const notes = typeof req.body?.notes === "string" ? req.body.notes.trim().slice(0, 500) : "";
+  try {
+    const closed = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      await lockBusiness(tx, businessId);
+      const day = await tx.businessDay.findFirst({ where: { businessId, status: "OPEN" } });
+      if (!day) throw new HttpError(409, { error: "There is no open business day to close.", code: "NO_OPEN_DAY" });
+      if (!day.postedAt) throw new HttpError(409, { error: "Do the finance posting first. It counts the money so the cashiers can go.", code: "NOT_POSTED" });
+
+      const openTabs = await tx.order.count({ where: { businessId, status: "OPEN" } });
+      if (openTabs > 0) {
+        throw new HttpError(409, { error: `${openTabs} table tab${openTabs === 1 ? " is" : "s are"} still open. Pay or cancel ${openTabs === 1 ? "it" : "them"} first.`, code: "OPEN_TABS", openTabs });
+      }
+
+      const ded = await getDeductionState(tx, businessId);
+      if (ded.dayEnd) {
+        if (ded.pending) {
+          throw new HttpError(409, { error: `SD-${String(ded.pending.number).padStart(4, "0")} is waiting to be uploaded in Stock Adjustment.`, code: "STOCK_STEPS" });
+        }
+        const pending = await countPendingSales(tx, businessId, ded);
+        if (pending > 0) {
+          throw new HttpError(409, { error: `${pending} sale${pending === 1 ? " has" : "s have"} not been deducted from stock yet. Use Deduct Sales first.`, code: "STOCK_STEPS" });
+        }
+      }
+
+      return tx.businessDay.update({
+        where: { id: day.id },
+        data: { status: "CLOSED", closedAt: new Date(), closedById: userId, ...(notes ? { closeNotes: notes } : {}) },
+      });
+    });
+
+    await recordAudit({ businessId, userId, action: "DAY_CLOSED", entity: "BusinessDay", entityId: closed.id });
+    const names = await userNames([closed.openedById, closed.postedById, closed.closedById]);
+    return res.json({ day: serializeDay(closed, names) });
   } catch (err) {
     return sendError(res, err);
   }
@@ -366,7 +433,7 @@ router.get("/", requirePermission("day.close", "finance.view"), async (req, res)
     orderBy: { openedAt: "desc" },
     take: limit,
   });
-  const names = await userNames(days.flatMap((d: any) => [d.openedById, d.closedById]));
+  const names = await userNames(days.flatMap((d: any) => [d.openedById, d.postedById, d.closedById]));
   return res.json({ days: days.map((d: any) => serializeDay(d, names)) });
 });
 
@@ -379,9 +446,9 @@ router.get("/:id", requirePermission("day.close", "finance.view"), async (req, r
   });
   if (!day) return res.status(404).json({ error: "Business day not found" });
 
-  const to = day.closedAt ?? new Date();
+  const to = day.postedAt ?? day.closedAt ?? new Date();
   const figures = await gatherDayFigures(prisma as unknown as Prisma.TransactionClient, businessId, day.openedAt, to);
-  const names = await userNames([day.openedById, day.closedById]);
+  const names = await userNames([day.openedById, day.postedById, day.closedById]);
 
   const order = new Map<string, number>(COUNTED_METHODS.map((m, i) => [m as string, i]));
   const counts = [...day.counts]

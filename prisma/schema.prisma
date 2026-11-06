@@ -123,6 +123,11 @@ model Business {
   groupId String? // set when this business is one branch of a group (chain)
   group   BusinessGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
   branchType BranchType @default(OUTLET)
+  deductionCounter Int @default(0) // incremented per sales-to-stock deduction (SD-0001)
+  // Restaurants: selling does not touch stock. The manager deducts the day's sales from
+  // stock afterwards, so the books show what SHOULD be left to compare with the count.
+  deductStockAtDayEnd Boolean @default(false)
+  stockDeductionStart DateTime? // sales before this were deducted as they happened
   dayCounter Int @default(0) // incremented atomically per business day (finance posting FP-0001)
   shortCode String? @unique // the code a cashier types on the till screen, with their staff number and PIN
   requireShift Boolean @default(false) // when true, selling needs an open cashier shift
@@ -164,6 +169,7 @@ model Business {
   stockCounts StockCount[]
 
   @@index([groupId])
+  stockDeductions StockDeduction[]
   @@map("businesses")
 }
 
@@ -729,6 +735,11 @@ model BusinessDay {
   openDenominations  Json? // { "50": 4, "0.5": 2 } notes and coins counted for the float
   closeDenominations Json? // the same, for the cash counted at close
 
+  // Finance posting: the cash-up. Cashiers are done once this is saved; the manager
+  // then does the stock steps and closes the day (closedAt) last.
+  postedAt      DateTime?
+  postedById    String?
+
   closedAt      DateTime?
   closedById    String?
   closeNotes    String?
@@ -1005,4 +1016,32 @@ model Shift {
   @@index([businessId, openedAt])
   @@index([userId, status])
   @@map("shifts")
+}
+
+// One run of "deduct sales from stock": every sale since the last run, turned into
+// ingredient and item movements. lines keeps what was used, for the history screen.
+// PENDING = worked out and downloaded as a file, stock not touched yet.
+// APPLIED = the file was uploaded in Stock Adjustment and stock was changed.
+enum DeductionStatus {
+  PENDING
+  APPLIED
+}
+
+model StockDeduction {
+  id          String   @id @default(uuid())
+  businessId  String
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  number      Int
+  fromAt      DateTime
+  toAt        DateTime
+  salesCount  Int
+  lines       Json
+  status      DeductionStatus @default(PENDING)
+  createdById String
+  createdAt   DateTime @default(now())
+  appliedAt   DateTime?
+  appliedById String?
+
+  @@index([businessId, toAt])
+  @@map("stock_deductions")
 }

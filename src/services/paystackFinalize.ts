@@ -4,6 +4,7 @@ import { verifyTransaction } from "./paystack";
 import { getBusinessPaystackSecretKey } from "./businessPaystackKeys";
 import { priceSaleItems, nextReceiptNumber } from "./salePricing";
 import { applyProductStock } from "./productStock";
+import { getDeductionState } from "./stockDeduction";
 import { recordAudit } from "../utils/audit";
 import { postSaleJournalEntry } from "./saleJournal";
 
@@ -123,7 +124,8 @@ export async function finalizePaystackTransaction(reference: string): Promise<Fi
       include: { items: true },
     });
 
-    for (const l of lineData) {
+    const deduction = await getDeductionState(tx, existing.businessId);
+    for (const l of deduction.dayEnd ? [] : lineData) {
       await applyProductStock({
         tx,
         businessId: existing.businessId,

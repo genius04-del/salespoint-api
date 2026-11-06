@@ -7,6 +7,7 @@ import { recordAudit } from "../utils/audit";
 import { applyInventoryMovement } from "../services/inventory";
 import { applyIngredientMovement } from "../services/ingredientStock";
 import { countLineVariance } from "../services/stockMath";
+import { countPendingSales, getDeductionState } from "../services/stockDeduction";
 import { postShrinkageEntry } from "../services/kitchenLedger";
 
 const router = Router();
@@ -26,6 +27,25 @@ router.post("/", requirePermission("stock.count"), async (req, res) => {
   const open = await prisma.stockCount.findFirst({ where: { businessId, status: "DRAFT" }, select: { id: true } });
   if (open) {
     return res.status(409).json({ error: "A count is already in progress. Finish or delete it first.", countId: open.id });
+  }
+
+  // Day-end restaurants: the count compares against stock AFTER the day's sales are
+  // taken off, so the difference is a real variance and not just the sales.
+  const deduction = await getDeductionState(prisma as unknown as Prisma.TransactionClient, businessId);
+  if (deduction.dayEnd && deduction.pending) {
+    return res.status(409).json({
+      error: `Deduction SD-${String(deduction.pending.number).padStart(4, "0")} has not been saved yet. Upload its file in Stock Adjustment first, then count.`,
+      code: "DEDUCTION_NOT_APPLIED",
+    });
+  }
+  if (deduction.dayEnd) {
+    const pending = await countPendingSales(prisma as unknown as Prisma.TransactionClient, businessId, deduction);
+    if (pending > 0) {
+      return res.status(409).json({
+        error: `${pending} sale${pending === 1 ? " has" : "s have"} not been deducted from stock yet. Deduct sales from stock first, then count.`,
+        code: "SALES_NOT_DEDUCTED",
+      });
+    }
   }
 
   const { scope } = parsed.data;

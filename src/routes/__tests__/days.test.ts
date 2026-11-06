@@ -15,6 +15,9 @@ const state = vi.hoisted(() => ({
   accounts: [] as any[],
   requireOpenDay: false,
   dayCounter: 0,
+  dayEnd: false,
+  pendingDeduction: null as any,
+  pendingSales: 0,
 }));
 
 vi.mock("../../config/prisma", () => {
@@ -22,7 +25,7 @@ vi.mock("../../config/prisma", () => {
     $queryRaw: async () => [],
     $transaction: async (fn: any) => fn(prisma),
     business: {
-      findUnique: async () => ({ requireOpenDay: state.requireOpenDay, restaurantModeEnabled: false }),
+      findUnique: async () => ({ requireOpenDay: state.requireOpenDay, restaurantModeEnabled: false, deductStockAtDayEnd: state.dayEnd, stockDeductionStart: null }),
       update: async () => ({ dayCounter: ++state.dayCounter }),
     },
     businessDay: {
@@ -37,15 +40,18 @@ vi.mock("../../config/prisma", () => {
       },
       update: async ({ data }: any) => {
         state.openDay = { ...state.openDay, ...data };
-        state.closedDays.unshift({ ...state.openDay, counts: state.counts });
-        const closed = state.openDay;
-        state.openDay = null;
-        return closed;
+        const day = state.openDay;
+        if (data.status === "CLOSED") {
+          state.closedDays.unshift({ ...day, counts: state.counts });
+          state.openDay = null;
+        }
+        return day;
       },
     },
-    businessDayCount: { createMany: async ({ data }: any) => void state.counts.push(...data) },
+    businessDayCount: { createMany: async ({ data }: any) => void state.counts.push(...data), findMany: async () => state.counts },
     order: { count: async () => state.openOrders },
-    sale: { findMany: async (args: any) => (args.where.status === "COMPLETED" ? state.sales : []) },
+    stockDeduction: { findFirst: async () => state.pendingDeduction },
+    sale: { findMany: async (args: any) => (args.where.status === "COMPLETED" ? state.sales : []), count: async () => state.pendingSales },
     expense: { findMany: async () => state.expenses },
     purchasePayment: { findMany: async () => state.supplierPayments },
     user: { findMany: async () => [{ id: "u1", name: "Ama Manager" }, { id: "u2", name: "Kojo Cashier" }] },
@@ -123,6 +129,9 @@ beforeEach(() => {
   ];
   state.requireOpenDay = false;
   state.dayCounter = 0;
+  state.dayEnd = false;
+  state.pendingDeduction = null;
+  state.pendingSales = 0;
 });
 
 async function openDay(float = 100) {
@@ -159,26 +168,26 @@ describe("finance posting numbers and notes/coins", () => {
     expect(ok.body.day.openDenominations).toEqual({ "50": 1, "20": 2, "5": 2 });
   });
 
-  it("keeps the notes and coins counted at close, and checks them against the cash counted", async () => {
+  it("keeps the notes and coins counted at the finance posting, and checks them against the cash counted", async () => {
     await openDay(100);
-    const bad = await request(app).post("/days/close").set(MANAGER).send({ counts: [{ method: "CASH", counted: 100 }], denominations: { "50": 1 } });
+    const bad = await request(app).post("/days/post").set(MANAGER).send({ counts: [{ method: "CASH", counted: 100 }], denominations: { "50": 1 } });
     expect(bad.status).toBe(400);
-    const ok = await request(app).post("/days/close").set(MANAGER).send({ counts: [{ method: "CASH", counted: 100 }], denominations: { "50": 2 } });
+    const ok = await request(app).post("/days/post").set(MANAGER).send({ counts: [{ method: "CASH", counted: 100 }], denominations: { "50": 2 } });
     expect(ok.status).toBe(200);
     expect(ok.body.day.closeDenominations).toEqual({ "50": 2 });
   });
 });
 
-describe("closing the day (cash-up)", () => {
-  it("closes cleanly when the count matches, and posts nothing to the ledger", async () => {
+describe("finance posting (the cash-up)", () => {
+  it("posts cleanly when the count matches, and posts nothing to the ledger", async () => {
     await openDay(100);
     state.sales = [sale("CASH", 400), sale("MOBILE_MONEY", 250)];
-    const res = await request(app).post("/days/close").set(MANAGER).send({
+    const res = await request(app).post("/days/post").set(MANAGER).send({
       counts: [{ method: "CASH", counted: 500 }, { method: "MOBILE_MONEY", counted: 250 }],
     });
     expect(res.status).toBe(200);
     expect(res.body.balanced).toBe(true);
-    expect(res.body.day.status).toBe("CLOSED");
+    expect(res.body.day.posted).toBe(true);
     expect(res.body.day.totalVariance).toBe(0);
     expect(state.journals).toHaveLength(0);
   });
@@ -188,7 +197,7 @@ describe("closing the day (cash-up)", () => {
     state.sales = [sale("CASH", 400)];
     state.expenses = [{ amount: 30, paymentAccount: { code: "1000" } }];
     state.supplierPayments = [{ amount: 20, method: "CASH" }];
-    const res = await request(app).post("/days/close").set(MANAGER).send({
+    const res = await request(app).post("/days/post").set(MANAGER).send({
       counts: [{ method: "CASH", counted: 450 }], // 100 + 400 - 30 - 20
     });
     expect(res.status).toBe(200);
@@ -198,7 +207,7 @@ describe("closing the day (cash-up)", () => {
   it("refuses to close on a shortage until the manager confirms it", async () => {
     await openDay(100);
     state.sales = [sale("CASH", 400)];
-    const res = await request(app).post("/days/close").set(MANAGER).send({
+    const res = await request(app).post("/days/post").set(MANAGER).send({
       counts: [{ method: "CASH", counted: 480 }],
     });
     expect(res.status).toBe(409);
@@ -210,7 +219,7 @@ describe("closing the day (cash-up)", () => {
   it("requires a written reason to close with a difference", async () => {
     await openDay(100);
     state.sales = [sale("CASH", 400)];
-    const res = await request(app).post("/days/close").set(MANAGER).send({
+    const res = await request(app).post("/days/post").set(MANAGER).send({
       counts: [{ method: "CASH", counted: 480 }],
       acceptVariance: true,
     });
@@ -221,7 +230,7 @@ describe("closing the day (cash-up)", () => {
   it("closes with a confirmed shortage and posts a BALANCED Cash Over/Short entry", async () => {
     await openDay(100);
     state.sales = [sale("CASH", 400)];
-    const res = await request(app).post("/days/close").set(MANAGER).send({
+    const res = await request(app).post("/days/post").set(MANAGER).send({
       counts: [{ method: "CASH", counted: 480 }],
       acceptVariance: true,
       notes: "GH₵20 short, change given wrongly",
@@ -243,7 +252,7 @@ describe("closing the day (cash-up)", () => {
   it("an overage debits the money account and credits Cash Over/Short", async () => {
     await openDay(0);
     state.sales = [sale("CASH", 100)];
-    await request(app).post("/days/close").set(MANAGER).send({
+    await request(app).post("/days/post").set(MANAGER).send({
       counts: [{ method: "CASH", counted: 110 }],
       acceptVariance: true,
       notes: "customer overpaid, no change given",
@@ -256,7 +265,7 @@ describe("closing the day (cash-up)", () => {
   it("will not close when a counted method with money expected is left blank", async () => {
     await openDay(0);
     state.sales = [sale("CASH", 100), sale("MOBILE_MONEY", 50)];
-    const res = await request(app).post("/days/close").set(MANAGER).send({
+    const res = await request(app).post("/days/post").set(MANAGER).send({
       counts: [{ method: "CASH", counted: 100 }],
     });
     expect(res.status).toBe(400);
@@ -267,21 +276,92 @@ describe("closing the day (cash-up)", () => {
   it("will not close while restaurant tabs are still open", async () => {
     await openDay(0);
     state.openOrders = 2;
-    const res = await request(app).post("/days/close").set(MANAGER).send({ counts: [] });
+    const res = await request(app).post("/days/post").set(MANAGER).send({ counts: [] });
     expect(res.status).toBe(409);
     expect(res.body.code).toBe("OPEN_TABS");
   });
 
-  it("a cashier (day.open, no day.close) cannot close the day", async () => {
+  it("a cashier (day.open, no day.close) cannot do the finance posting", async () => {
     await openDay(0);
-    const res = await request(app).post("/days/close").set(CASHIER).send({ counts: [] });
+    const res = await request(app).post("/days/post").set(CASHIER).send({ counts: [] });
     expect(res.status).toBe(403);
   });
 
   it("says so clearly when there is no open day", async () => {
-    const res = await request(app).post("/days/close").set(MANAGER).send({ counts: [] });
+    const res = await request(app).post("/days/post").set(MANAGER).send({ counts: [] });
     expect(res.status).toBe(409);
     expect(res.body.code).toBe("NO_OPEN_DAY");
+  });
+});
+
+describe("closing the day, last of all", () => {
+  const post = (counts = [{ method: "CASH", counted: 100 }]) => request(app).post("/days/post").set(MANAGER).send({ counts });
+
+  it("cannot be closed before the finance posting", async () => {
+    await openDay(100);
+    const res = await request(app).post("/days/close").set(MANAGER).send({});
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("NOT_POSTED");
+    expect(state.openDay.status ?? "OPEN").toBe("OPEN");
+  });
+
+  it("posting leaves the day open; closing afterwards finishes it", async () => {
+    await openDay(100);
+    const posted = await post();
+    expect(posted.status).toBe(200);
+    expect(posted.body.day.status).toBe("OPEN");
+    expect(posted.body.day.posted).toBe(true);
+    const closed = await request(app).post("/days/close").set(MANAGER).send({});
+    expect(closed.status).toBe(200);
+    expect(closed.body.day.status).toBe("CLOSED");
+    expect(state.openDay).toBeNull();
+  });
+
+  it("the finance posting can only be saved once", async () => {
+    await openDay(100);
+    await post();
+    const again = await post();
+    expect(again.status).toBe(409);
+    expect(again.body.code).toBe("DAY_ALREADY_POSTED");
+  });
+
+  it("a restaurant that deducts at day end cannot close until sales are deducted and uploaded", async () => {
+    await openDay(100);
+    await post();
+    state.dayEnd = true;
+    state.pendingSales = 4;
+    const unsold = await request(app).post("/days/close").set(MANAGER).send({});
+    expect(unsold.status).toBe(409);
+    expect(unsold.body.code).toBe("STOCK_STEPS");
+    state.pendingSales = 0;
+    state.pendingDeduction = { id: "sd1", number: 3, status: "PENDING", fromAt: new Date(), toAt: new Date() };
+    const waiting = await request(app).post("/days/close").set(MANAGER).send({});
+    expect(waiting.status).toBe(409);
+    expect(waiting.body.error).toContain("SD-0003");
+    state.pendingDeduction = null;
+    expect((await request(app).post("/days/close").set(MANAGER).send({})).status).toBe(200);
+  });
+
+  it("a cashier cannot close the day", async () => {
+    await openDay(0);
+    expect((await request(app).post("/days/close").set(CASHIER).send({})).status).toBe(403);
+  });
+
+  it("once cashed up, nothing more can be sold into the day", async () => {
+    await openDay(0);
+    await request(app).post("/days/post").set(MANAGER).send({ counts: [] });
+    const sell = await request(app).post("/sales/checkout");
+    expect(sell.status).toBe(409);
+    expect(sell.body.code).toBe("DAY_POSTED");
+  });
+
+  it("a manager is shown the posted counts while the stock steps are still to do", async () => {
+    await openDay(100);
+    state.sales = [sale("CASH", 400)];
+    await post([{ method: "CASH", counted: 500 }]);
+    const cur = await request(app).get("/days/current").set(MANAGER);
+    expect(cur.body.day.posted).toBe(true);
+    expect(cur.body.posting[0]).toMatchObject({ method: "CASH", counted: 500, variance: 0 });
   });
 });
 

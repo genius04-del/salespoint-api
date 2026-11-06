@@ -1,5 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { productsWithRecipes } from "./productStock";
+import { getDeductionState } from "./stockDeduction";
 
 export interface SaleLineInput {
   productId: string;
@@ -30,6 +31,8 @@ export async function priceSaleItems(
   // Dishes made from a recipe are stocked by their ingredients, so their own
   // quantity (always 0) must not block the sale.
   const recipeProducts = await productsWithRecipes(tx, productIds);
+  // Day-end restaurants sell freely; stock is deducted afterwards by the manager.
+  const { dayEnd } = await getDeductionState(tx, businessId);
 
   let oversold = false;
   for (const item of items) {
@@ -37,7 +40,7 @@ export async function priceSaleItems(
     if (!product.isActive) {
       throw new Error(`PRODUCT_INACTIVE:${product.name}`);
     }
-    if (!recipeProducts.has(product.id) && product.currentQuantity < item.quantity) {
+    if (!dayEnd && !recipeProducts.has(product.id) && product.currentQuantity < item.quantity) {
       if (!opts.allowOversell) {
         throw new Error(`INSUFFICIENT_STOCK:${product.name}`);
       }

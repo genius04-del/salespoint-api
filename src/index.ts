@@ -33,6 +33,7 @@ import stockCountRoutes from "./routes/stockCounts";
 import stockVarianceRoutes from "./routes/stockVariance";
 import { authenticate } from "./middleware/auth";
 import groupRoutes from "./routes/groups";
+import stockDeductionRoutes from "./routes/stockDeductions";
 import { requireOpenDay } from "./middleware/requireOpenDay";
 import { requireOpenShift } from "./middleware/requireOpenShift";
 import pinAuthRoutes from "./routes/pinAuth";
@@ -166,6 +167,7 @@ app.use("/recipes", recipeRoutes);
 app.use("/production", productionRoutes);
 app.use("/stock-counts", stockCountRoutes);
 app.use("/stock-variance", stockVarianceRoutes);
+app.use("/stock-deductions", stockDeductionRoutes);
 
 // Centralized error handler — keeps stack traces out of API responses.
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {

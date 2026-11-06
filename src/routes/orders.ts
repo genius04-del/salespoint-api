@@ -6,6 +6,7 @@ import { authenticate, requirePermission } from "../middleware/auth";
 import { requireRestaurantMode } from "../middleware/restaurantMode";
 import { recordAudit } from "../utils/audit";
 import { applyProductStock, productsWithRecipes } from "../services/productStock";
+import { getDeductionState, wasDeducted } from "../services/stockDeduction";
 import { nextReceiptNumber, mapPricingError } from "../services/salePricing";
 import { postSaleJournalEntry } from "../services/saleJournal";
 
@@ -36,11 +37,13 @@ async function addItemsToOrder(
   const productMap = new Map(products.map((p) => [p.id, p]));
   // Dishes made from a recipe are stocked by their ingredients, not by their own quantity.
   const recipeProducts = await productsWithRecipes(tx, productIds);
+  // Day-end restaurants don't touch stock when an order is taken.
+  const { dayEnd } = await getDeductionState(tx, params.businessId);
 
   for (const item of params.items) {
     const product = productMap.get(item.productId)!;
     if (!product.isActive) throw new Error(`PRODUCT_INACTIVE:${product.name}`);
-    if (!recipeProducts.has(product.id) && product.currentQuantity < item.quantity) throw new Error(`INSUFFICIENT_STOCK:${product.name}`);
+    if (!dayEnd && !recipeProducts.has(product.id) && product.currentQuantity < item.quantity) throw new Error(`INSUFFICIENT_STOCK:${product.name}`);
   }
 
   const created = [];
@@ -57,7 +60,7 @@ async function addItemsToOrder(
         notes: item.notes,
       },
     });
-    await applyProductStock({
+    if (!dayEnd) await applyProductStock({
       tx,
       businessId: params.businessId,
       productId: product.id,
@@ -213,7 +216,8 @@ router.patch("/items/:itemId/status", requirePermission("kitchen.manage"), async
   // reverses just that item's stock — nothing else on the order is touched.
   if (parsed.data.status === "CANCELLED") {
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      await applyProductStock({
+      const deduction = await getDeductionState(tx, req.auth!.businessId);
+      if (wasDeducted(deduction, item.createdAt)) await applyProductStock({
         tx,
         businessId: req.auth!.businessId,
         productId: item.productId,
@@ -256,8 +260,10 @@ router.post("/:id/cancel", requirePermission("sales.cancel"), async (req, res) =
   if (order.status !== "OPEN") return res.status(409).json({ error: `Order is already ${order.status}` });
 
   await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    const deduction = await getDeductionState(tx, req.auth!.businessId);
     for (const item of order.items) {
       if (item.kitchenStatus === "CANCELLED") continue; // already reversed individually
+      if (!wasDeducted(deduction, item.createdAt)) continue; // day-end mode: never taken off stock
       await applyProductStock({
         tx,
         businessId: req.auth!.businessId,

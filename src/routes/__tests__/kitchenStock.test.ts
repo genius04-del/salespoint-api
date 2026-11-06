@@ -58,6 +58,7 @@ vi.mock("../../config/prisma", () => {
       // The journal-number counter: bumped on every run.
       update: async () => ({ productionCounter: ++db.counter.journalNo }),
     },
+    stockDeduction: { findFirst: async () => null },
     stockCount,
     stockCountLine: db.model("stockCountLine"),
     product: db.model("product"),

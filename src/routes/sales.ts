@@ -5,6 +5,7 @@ import { prisma } from "../config/prisma";
 import { authenticate, requirePermission } from "../middleware/auth";
 import { recordAudit } from "../utils/audit";
 import { applyProductStock } from "../services/productStock";
+import { getDeductionState, inPendingDeduction, wasDeducted } from "../services/stockDeduction";
 import { priceSaleItems, nextReceiptNumber, mapPricingError } from "../services/salePricing";
 import { createRefund } from "../services/paystack";
 import { getBusinessPaystackSecretKey, PaystackNotConfiguredError } from "../services/businessPaystackKeys";
@@ -104,7 +105,9 @@ router.post("/checkout", requirePermission("sales.create"), async (req, res) => 
       });
 
       // Reduce stock for each line, one movement per product, referencing this sale.
-      for (const l of lineData) {
+      // Day-end restaurants skip this: the manager deducts the day's sales later.
+      const deduction = await getDeductionState(tx, req.auth!.businessId);
+      for (const l of deduction.dayEnd ? [] : lineData) {
         await applyProductStock({
           tx,
           businessId: req.auth!.businessId,
@@ -245,6 +248,14 @@ router.post("/:id/cancel", requirePermission("sales.cancel"), async (req, res) =
     return res.status(409).json({ error: "Sale is already cancelled" });
   }
 
+  const deductionNow = await getDeductionState(prisma as unknown as Prisma.TransactionClient, req.auth!.businessId);
+  if (inPendingDeduction(deductionNow, sale.createdAt)) {
+    return res.status(409).json({
+      error: `This sale is in stock deduction SD-${String(deductionNow.pending!.number).padStart(4, "0")}, which is waiting in Stock Adjustment. Upload it there (or cancel it on the Deduct Sales page) first, then cancel the sale.`,
+      code: "SALE_IN_PENDING_DEDUCTION",
+    });
+  }
+
   // For a Paystack sale, actually move the money back BEFORE touching
   // stock/status — never mark something "refunded" that we didn't confirm
   // with the provider. If the refund call fails, the cancellation aborts.
@@ -271,7 +282,9 @@ router.post("/:id/cancel", requirePermission("sales.cancel"), async (req, res) =
   const costTotal = sale.items.reduce((sum, item) => sum + Number(item.unitCost) * item.quantity, 0);
 
   const updated = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-    for (const item of sale.items) {
+    // Put stock back only if it was actually taken off (a day-end sale not yet deducted never was).
+    const deduction = await getDeductionState(tx, req.auth!.businessId);
+    for (const item of wasDeducted(deduction, sale.createdAt) ? sale.items : []) {
       await applyProductStock({
         tx,
         businessId: req.auth!.businessId,
