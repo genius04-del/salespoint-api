@@ -1,6 +1,5 @@
 import { Router } from "express";
 import { z } from "zod";
-import { Prisma } from "@prisma/client";
 import { prisma } from "../config/prisma";
 import { authenticate, requirePermission } from "../middleware/auth";
 import { recordAudit } from "../utils/audit";
@@ -35,7 +34,7 @@ const serialize = (r: any, names: Map<string, string>) => ({
 // ---- GET /stock-deductions/preview ---- what the sales since the last run would use
 router.get("/preview", requirePermission(...CREATE), async (req, res) => {
   const { businessId } = req.auth!;
-  const db = prisma as unknown as Prisma.TransactionClient;
+  const db = prisma as any;
   const state = await getDeductionState(db, businessId);
   if (!state.dayEnd) return res.json({ enabled: false });
 
@@ -57,7 +56,7 @@ router.post("/", requirePermission(...CREATE), async (req, res) => {
   const { businessId, userId } = req.auth!;
 
   const result = await prisma.$transaction(
-    async (tx: Prisma.TransactionClient) => {
+    async (tx) => {
       await tx.$queryRaw`SELECT id FROM businesses WHERE id = ${businessId} FOR UPDATE`;
       const state = await getDeductionState(tx, businessId);
       if (!state.dayEnd) return { status: 409, body: { error: "Sales are deducted as they happen in this business, so there is nothing to run." } };
@@ -98,14 +97,14 @@ router.post("/apply", requirePermission(...APPLY), async (req, res) => {
   const { businessId, userId } = req.auth!;
 
   const result = await prisma.$transaction(
-    async (tx: Prisma.TransactionClient) => {
+    async (tx) => {
       await tx.$queryRaw`SELECT id FROM businesses WHERE id = ${businessId} FOR UPDATE`;
       const row = await tx.stockDeduction.findFirst({ where: { businessId, number: parsed.data.number } });
       if (!row) return { status: 404, body: { error: `${ref(parsed.data.number)} was not found in this business. Is the file from another branch?` } };
       if (row.status === "APPLIED") return { status: 409, body: { error: `${ref(row.number)} was already saved. A file can only be uploaded once.`, code: "ALREADY_APPLIED" } };
 
       // The file must say exactly what the run says: same items, same quantities.
-      const stored = new Map<string, UsageLine>((row.lines as UsageLine[]).map((l) => [`${l.kind}:${l.id}`, l]));
+      const stored = new Map<string, UsageLine>((row.lines as unknown as UsageLine[]).map((l) => [`${l.kind}:${l.id}`, l]));
       const sent = new Map(parsed.data.lines.map((l) => [`${l.kind}:${l.id}`, l.quantity]));
       const problems: string[] = [];
       for (const [key, line] of stored) {
@@ -118,7 +117,7 @@ router.post("/apply", requirePermission(...APPLY), async (req, res) => {
         return { status: 400, body: { error: `This file does not match ${ref(row.number)} (${problems.slice(0, 3).join("; ")}). Download it again and upload it without changing it.`, problems, code: "FILE_MISMATCH" } };
       }
 
-      await applyUsage({ tx, businessId, userId, lines: row.lines as UsageLine[], reason: `Sales deduction ${ref(row.number)}`, reference: row.id });
+      await applyUsage({ tx, businessId, userId, lines: row.lines as unknown as UsageLine[], reason: `Sales deduction ${ref(row.number)}`, reference: row.id });
       const done = await tx.stockDeduction.update({ where: { id: row.id }, data: { status: "APPLIED", appliedAt: new Date(), appliedById: userId } });
       return { status: 200, body: { deduction: serialize(done, new Map()) } };
     },
