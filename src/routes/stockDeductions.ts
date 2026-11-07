@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../config/prisma";
 import { authenticate, requirePermission } from "../middleware/auth";
 import { recordAudit } from "../utils/audit";
@@ -34,7 +35,7 @@ const serialize = (r: any, names: Map<string, string>) => ({
 // ---- GET /stock-deductions/preview ---- what the sales since the last run would use
 router.get("/preview", requirePermission(...CREATE), async (req, res) => {
   const { businessId } = req.auth!;
-  const db = prisma as any;
+  const db = prisma as unknown as Prisma.TransactionClient;
   const state = await getDeductionState(db, businessId);
   if (!state.dayEnd) return res.json({ enabled: false });
 
@@ -56,7 +57,7 @@ router.post("/", requirePermission(...CREATE), async (req, res) => {
   const { businessId, userId } = req.auth!;
 
   const result = await prisma.$transaction(
-    async (tx) => {
+    async (tx: Prisma.TransactionClient) => {
       await tx.$queryRaw`SELECT id FROM businesses WHERE id = ${businessId} FOR UPDATE`;
       const state = await getDeductionState(tx, businessId);
       if (!state.dayEnd) return { status: 409, body: { error: "Sales are deducted as they happen in this business, so there is nothing to run." } };
@@ -97,7 +98,7 @@ router.post("/apply", requirePermission(...APPLY), async (req, res) => {
   const { businessId, userId } = req.auth!;
 
   const result = await prisma.$transaction(
-    async (tx) => {
+    async (tx: Prisma.TransactionClient) => {
       await tx.$queryRaw`SELECT id FROM businesses WHERE id = ${businessId} FOR UPDATE`;
       const row = await tx.stockDeduction.findFirst({ where: { businessId, number: parsed.data.number } });
       if (!row) return { status: 404, body: { error: `${ref(parsed.data.number)} was not found in this business. Is the file from another branch?` } };

@@ -67,3 +67,9 @@ export function wouldCreateCycle(
 export function toNum(v: Prisma.Decimal.Value | null | undefined) {
   return v === null || v === undefined ? 0 : Number(v);
 }
+
+// "A 50 kg bag costs GH₵650" -> GH₵13 per kg. Undefined when either part is missing.
+export function costFromPack(packSize?: number, packPrice?: number): number | undefined {
+  if (!packSize || packPrice === undefined) return undefined;
+  return Math.round((packPrice / packSize) * 10000) / 10000;
+}

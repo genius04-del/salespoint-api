@@ -9,13 +9,14 @@ import {
   applyIngredientMovement,
   syncProductsUsingIngredient,
 } from "../services/ingredientStock";
-import { weightedAverageCost, wouldCreateCycle } from "../services/stockMath";
+import { costFromPack, weightedAverageCost, wouldCreateCycle } from "../services/stockMath";
 import { postIngredientPurchaseEntry, postShrinkageEntry, RECEIVE_PAID_WITH } from "../services/kitchenLedger";
 
 const router = Router();
 router.use(authenticate, requireRestaurantMode);
 
 const qty = z.number().positive().max(1_000_000);
+
 
 export function mapIngredientError(err: any): { status: number; error: string } | null {
   const m = err?.message as string | undefined;
@@ -45,6 +46,9 @@ const createSchema = z.object({
   category: z.string().trim().max(40).optional(),
   minStockLevel: z.number().min(0).default(0),
   costPerUnit: z.number().min(0).default(0),
+  packName: z.string().trim().max(20).optional(),
+  packSize: z.number().positive().max(1_000_000).optional(),
+  packPrice: z.number().min(0).max(100_000_000).optional(), // price of one pack; cost per unit = packPrice / packSize
   openingQuantity: z.number().min(0).default(0),
 });
 
@@ -66,7 +70,9 @@ router.post("/", requirePermission("stock.manage"), async (req, res) => {
         isPrepared: d.isPrepared,
         category: d.category || null,
         minStockLevel: d.minStockLevel,
-        costPerUnit: d.costPerUnit,
+        costPerUnit: costFromPack(d.packSize, d.packPrice) ?? d.costPerUnit,
+        packName: d.packSize ? d.packName || "Pack" : null,
+        packSize: d.packSize ?? null,
       },
     });
     if (d.openingQuantity > 0) {
@@ -94,6 +100,9 @@ const patchSchema = z.object({
   category: z.string().trim().max(40).nullable().optional(),
   minStockLevel: z.number().min(0).optional(),
   costPerUnit: z.number().min(0).optional(),
+  packName: z.string().trim().max(20).nullable().optional(),
+  packSize: z.number().positive().max(1_000_000).nullable().optional(),
+  packPrice: z.number().min(0).max(100_000_000).optional(),
   isActive: z.boolean().optional(),
 });
 
@@ -111,12 +120,16 @@ router.patch("/:id", requirePermission("stock.manage"), async (req, res) => {
   }
 
   const ingredient = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-    const { category, ...rest } = parsed.data;
+    const { category, packPrice, ...rest } = parsed.data;
+    const size = rest.packSize === undefined ? (existing.packSize ? Number(existing.packSize) : undefined) : rest.packSize ?? undefined;
+    const fromPack = costFromPack(size, packPrice);
+    if (fromPack !== undefined) rest.costPerUnit = fromPack;
+    if (rest.packSize === null) rest.packName = null;
     const updated = await tx.ingredient.update({
       where: { id: existing.id },
       data: { ...rest, ...(category !== undefined ? { category: category || null } : {}) },
     });
-    if (parsed.data.costPerUnit !== undefined) await syncProductsUsingIngredient(tx, existing.id);
+    if (rest.costPerUnit !== undefined) await syncProductsUsingIngredient(tx, existing.id);
     return updated;
   });
 

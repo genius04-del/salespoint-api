@@ -816,6 +816,8 @@ model Ingredient {
   currentQuantity Decimal  @db.Decimal(14, 3) @default(0)
   minStockLevel   Decimal  @db.Decimal(14, 3) @default(0)
   costPerUnit     Decimal  @db.Decimal(14, 4) @default(0) // weighted average
+  packName        String?  // how it is bought: Bag, Sachet, Tin... (null = loose, by the unit)
+  packSize        Decimal? @db.Decimal(14, 3) // how much one pack holds, in `unit`
   isActive        Boolean  @default(true)
 
   movements       IngredientMovement[]
