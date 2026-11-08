@@ -406,15 +406,21 @@ model PurchaseItem {
   purchaseId  String
   purchase    Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
 
-  productId   String
-  product     Product  @relation(fields: [productId], references: [id])
+  // Exactly one of these is set: a product (drinks, goods sold as they are) or
+  // an ingredient (the kitchen's raw stock). productName holds either name.
+  productId    String?
+  product      Product?    @relation(fields: [productId], references: [id], onDelete: Restrict)
+  ingredientId String?
+  ingredient   Ingredient? @relation(fields: [ingredientId], references: [id], onDelete: Restrict)
 
   productName String
-  costPrice   Decimal  @db.Decimal(12, 2)
-  quantity    Int
+  unit        String?  // ingredient lines: kg, litre, piece...
+  costPrice   Decimal  @db.Decimal(14, 4) // per unit
+  quantity    Decimal  @db.Decimal(14, 3)
   lineTotal   Decimal  @db.Decimal(12, 2)
 
   @@index([purchaseId])
+  @@index([ingredientId])
   @@map("purchase_items")
 }
 
@@ -826,6 +832,7 @@ model Ingredient {
   usedAsComponent PrepComponent[]       @relation("PrepComponent")
   batches         ProductionBatch[]
   batchLines      ProductionBatchLine[]
+  purchaseItems   PurchaseItem[]
 
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt

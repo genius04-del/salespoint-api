@@ -5,6 +5,9 @@ import { prisma } from "../config/prisma";
 import { authenticate, requirePermission } from "../middleware/auth";
 import { recordAudit } from "../utils/audit";
 import { applyInventoryMovement } from "../services/inventory";
+import { applyIngredientMovement, syncProductsUsingIngredient } from "../services/ingredientStock";
+import { weightedAverageCost } from "../services/stockMath";
+import { buildPurchaseLines } from "../services/purchaseLines";
 import { createJournalEntry, accountCodeForPaymentMethod, ACCOUNT_CODES } from "../services/journal";
 
 const router = Router();
@@ -17,16 +20,21 @@ function derivePaymentStatus(totalCost: Prisma.Decimal, amountPaid: Prisma.Decim
   return "PARTIAL" as const;
 }
 
+// A line is a product (drinks and goods sold as they are) or an ingredient
+// (the kitchen's raw stock). Ingredients can be bought in decimals.
 const purchaseItemSchema = z.object({
-  productId: z.string(),
-  quantity: z.number().int().positive(),
+  productId: z.string().optional(),
+  ingredientId: z.string().optional(),
+  quantity: z.number().positive().max(1_000_000),
   costPrice: z.number().min(0),
+  lineTotal: z.number().min(0).max(100_000_000).optional(),
 });
 
 const createPurchaseSchema = z.object({
   supplierId: z.string(),
   items: z.array(purchaseItemSchema).min(1),
   amountPaid: z.number().min(0).default(0),
+  paidWith: z.enum(["CASH", "MOBILE_MONEY", "BANK_TRANSFER"]).default("CASH"),
   notes: z.string().optional(),
 });
 
@@ -34,29 +42,27 @@ const createPurchaseSchema = z.object({
 router.post("/", requirePermission("purchases.manage"), async (req, res) => {
   const parsed = createPurchaseSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-  const { supplierId, items, amountPaid, notes } = parsed.data;
+  const { supplierId, items, amountPaid, paidWith, notes } = parsed.data;
 
   const supplier = await prisma.supplier.findFirst({
     where: { id: supplierId, businessId: req.auth!.businessId },
   });
   if (!supplier) return res.status(400).json({ error: "Supplier not found for this business" });
 
-  const productIds = items.map((i) => i.productId);
-  const products = await prisma.product.findMany({
-    where: { id: { in: productIds }, businessId: req.auth!.businessId },
-  });
-  if (products.length !== new Set(productIds).size) {
-    return res.status(400).json({ error: "One or more products not found for this business" });
-  }
-  const productMap = new Map(products.map((p) => [p.id, p]));
-
-  let totalCost = new Prisma.Decimal(0);
-  const lineData = items.map((item) => {
-    const product = productMap.get(item.productId)!;
-    const lineTotal = new Prisma.Decimal(item.costPrice).mul(item.quantity);
-    totalCost = totalCost.add(lineTotal);
-    return { product, item, lineTotal };
-  });
+  const businessId = req.auth!.businessId;
+  const productIds = items.map((i) => i.productId).filter((x): x is string => !!x);
+  const ingredientIds = items.map((i) => i.ingredientId).filter((x): x is string => !!x);
+  const [products, ingredients] = await Promise.all([
+    productIds.length ? prisma.product.findMany({ where: { id: { in: productIds }, businessId } }) : [],
+    ingredientIds.length ? prisma.ingredient.findMany({ where: { id: { in: ingredientIds }, businessId } }) : [],
+  ]);
+  const built = buildPurchaseLines(
+    items,
+    new Map(products.map((p: any) => [p.id as string, p])),
+    new Map(ingredients.map((i: any) => [i.id as string, i]))
+  );
+  if ("error" in built) return res.status(400).json({ error: built.error });
+  const { lines: lineData, total: totalCost } = built;
 
   const paidDecimal = new Prisma.Decimal(amountPaid);
   if (paidDecimal.gt(totalCost)) {
@@ -75,10 +81,12 @@ router.post("/", requirePermission("purchases.manage"), async (req, res) => {
         notes,
         items: {
           create: lineData.map((l) => ({
-            productId: l.product.id,
-            productName: l.product.name,
-            costPrice: l.item.costPrice,
-            quantity: l.item.quantity,
+            productId: l.kind === "product" ? l.refId : null,
+            ingredientId: l.kind === "ingredient" ? l.refId : null,
+            productName: l.name,
+            unit: l.unit,
+            costPrice: l.unitCost,
+            quantity: l.quantity,
             lineTotal: l.lineTotal,
           })),
         },
@@ -89,7 +97,7 @@ router.post("/", requirePermission("purchases.manage"), async (req, res) => {
                   {
                     businessId: req.auth!.businessId,
                     amount: paidDecimal,
-                    method: "CASH",
+                    method: paidWith,
                     notes: "Initial payment at purchase time",
                     userId: req.auth!.userId,
                   },
@@ -101,18 +109,40 @@ router.post("/", requirePermission("purchases.manage"), async (req, res) => {
       include: { items: true, payments: true },
     });
 
-    // Stock increases for every line, via the same choke-point sales/opening-stock use.
+    // Stock increases for every line, via the same choke-points sales and
+    // production use: products through InventoryMovement, ingredients through
+    // IngredientMovement (which also moves their average cost).
     for (const l of lineData) {
-      await applyInventoryMovement({
-        tx,
-        businessId: req.auth!.businessId,
-        productId: l.product.id,
-        type: "PURCHASE",
-        quantityChange: l.item.quantity,
-        reason: `Purchase from ${supplier.name}`,
-        reference: created.id,
-        userId: req.auth!.userId,
-      });
+      if (l.kind === "product") {
+        await applyInventoryMovement({
+          tx,
+          businessId,
+          productId: l.refId,
+          type: "PURCHASE",
+          quantityChange: l.quantity,
+          reason: `Purchase from ${supplier.name}`,
+          reference: created.id,
+          userId: req.auth!.userId,
+        });
+      } else {
+        const ing = await tx.ingredient.findFirst({ where: { id: l.refId, businessId } });
+        if (!ing) throw new Error("INGREDIENT_NOT_FOUND");
+        if (l.unitCost.gt(0)) {
+          const avg = weightedAverageCost(ing.currentQuantity, ing.costPerUnit, l.quantity, l.unitCost);
+          await tx.ingredient.update({ where: { id: ing.id }, data: { costPerUnit: avg.toDecimalPlaces(4) } });
+          await syncProductsUsingIngredient(tx, ing.id);
+        }
+        await applyIngredientMovement({
+          tx,
+          businessId,
+          ingredientId: ing.id,
+          type: "PURCHASE",
+          quantityChange: l.quantity,
+          reason: `Purchase from ${supplier.name}`,
+          reference: created.id,
+          userId: req.auth!.userId,
+        });
+      }
     }
 
     // Recognize the full liability first (Debit Inventory, Credit Accounts
@@ -141,7 +171,7 @@ router.post("/", requirePermission("purchases.manage"), async (req, res) => {
         createdById: req.auth!.userId,
         lines: [
           { accountCode: ACCOUNT_CODES.ACCOUNTS_PAYABLE, debit: Number(paidDecimal) },
-          { accountCode: accountCodeForPaymentMethod("CASH"), credit: Number(paidDecimal) },
+          { accountCode: accountCodeForPaymentMethod(paidWith), credit: Number(paidDecimal) },
         ],
       });
     }
