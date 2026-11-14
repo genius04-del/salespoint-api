@@ -1,3 +1,4 @@
+import { isRestaurantType } from "../utils/businessType";
 import { Router } from "express";
 import bcrypt from "bcrypt";
 import crypto from "crypto";
@@ -79,7 +80,7 @@ router.post("/register-business", async (req, res) => {
 
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     const business = await tx.business.create({
-      data: { name: businessName, businessType, currency },
+      data: { name: businessName, businessType, currency, restaurantModeEnabled: isRestaurantType(businessType) },
     });
 
     const owner = await tx.user.create({

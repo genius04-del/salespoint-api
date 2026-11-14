@@ -1,3 +1,4 @@
+import { isRestaurantType } from "../utils/businessType";
 import { Router } from "express";
 import { z } from "zod";
 import { Prisma } from "@prisma/client";
@@ -70,6 +71,15 @@ router.patch("/", authorize("OWNER"), async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
   const data: Record<string, unknown> = { ...parsed.data };
+
+  // Restaurant features are only for restaurants and bars. A shop can't switch them on.
+  if (parsed.data.restaurantModeEnabled === true || parsed.data.deductStockAtDayEnd === true) {
+    const current = await prisma.business.findUnique({ where: { id: req.auth!.businessId }, select: { businessType: true } });
+    if (!isRestaurantType(parsed.data.businessType ?? current?.businessType)) {
+      return res.status(400).json({ error: "Restaurant mode is only for restaurants and bars. Change the business type first if this is a restaurant." });
+    }
+  }
+
   if (parsed.data.deductStockAtDayEnd !== undefined) {
     const state = await getDeductionState(prisma as unknown as Prisma.TransactionClient, req.auth!.businessId);
     if (parsed.data.deductStockAtDayEnd && !state.dayEnd) {
